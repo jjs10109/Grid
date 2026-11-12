@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 import json
+import re
 from pathlib import Path
 from typing import Any, List, Tuple, Optional, Dict
 
@@ -9,6 +10,132 @@ import pandas as pd
 
 from config import DEFAULT_PRICE_ADJ
 from utils import norm_code, guess_market
+
+
+# 项目根目录（data_loader.py 位于项目根），持久化缓存默认放在其下。
+PROJECT_ROOT = Path(__file__).resolve().parent
+
+# 日频 WSD 持久化缓存的运行期配置，由 configure_daily_cache() 设置。
+_DAILY_CACHE: Dict[str, Any] = {
+    "enabled": True,      # 默认开启持久化缓存
+    "refresh": False,     # True 时忽略本地缓存、全量重取
+    "dir": None,          # None 时使用项目根 / wind_cache
+}
+
+
+def configure_daily_cache(
+    enabled: bool = True,
+    refresh: bool = False,
+    cache_dir: Optional[str | Path] = None,
+) -> None:
+    """配置日频 WSD 持久化缓存。主脚本在启动时按命令行参数调用。"""
+    _DAILY_CACHE["enabled"] = bool(enabled)
+    _DAILY_CACHE["refresh"] = bool(refresh)
+    _DAILY_CACHE["dir"] = Path(cache_dir).expanduser() if cache_dir else None
+
+
+def _daily_cache_dir() -> Path:
+    d = _DAILY_CACHE["dir"]
+    if d is None:
+        d = PROJECT_ROOT / "wind_cache"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def _safe_token(s: str) -> str:
+    return re.sub(r"[^A-Za-z0-9._-]", "_", str(s))
+
+
+def _daily_cache_path(code: str, price_adj: str) -> Path:
+    """每只标的、每个复权口径对应一个 parquet 缓存文件。"""
+    adj = str(price_adj or "").strip() or "none"
+    return _daily_cache_dir() / f"{_safe_token(norm_code(code))}__{_safe_token(adj)}.parquet"
+
+
+def _read_daily_cache(path: Path) -> Optional[pd.DataFrame]:
+    try:
+        if path.exists():
+            return normalize_daily_df(pd.read_parquet(path))
+    except Exception:
+        return None
+    return None
+
+
+def _write_daily_cache(path: Path, df: pd.DataFrame) -> None:
+    """原子写入：先写临时文件再替换，避免中断产生损坏缓存。落盘失败不阻断主流程。"""
+    try:
+        tmp = path.with_name(path.name + ".tmp")
+        df.to_parquet(tmp, index=False)
+        tmp.replace(path)
+    except Exception:
+        pass
+
+
+# 分钟频 WSI 持久化缓存的运行期配置，由 configure_minute_cache() 设置。
+_MINUTE_CACHE: Dict[str, Any] = {
+    "enabled": True,      # 默认开启持久化缓存
+    "refresh": False,     # True 时忽略本地缓存、重新向 WSI 请求
+    "dir": None,          # None 时使用项目根 / minute_cache
+}
+
+
+def configure_minute_cache(
+    enabled: bool = True,
+    refresh: bool = False,
+    cache_dir: Optional[str | Path] = None,
+) -> None:
+    """配置分钟频 WSI 持久化缓存。"""
+    _MINUTE_CACHE["enabled"] = bool(enabled)
+    _MINUTE_CACHE["refresh"] = bool(refresh)
+    _MINUTE_CACHE["dir"] = Path(cache_dir).expanduser() if cache_dir else None
+
+
+def _minute_cache_dir() -> Path:
+    d = _MINUTE_CACHE["dir"]
+    if d is None:
+        d = PROJECT_ROOT / "minute_cache"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def _minute_cache_path(code: str, bar_size: int, date: str) -> Path:
+    """每只标的、每个 bar 周期、每个交易日一个 parquet 缓存文件。"""
+    day = pd.to_datetime(date, errors="coerce")
+    day_token = day.strftime("%Y%m%d") if pd.notna(day) else _safe_token(date)
+    return _minute_cache_dir() / f"{_safe_token(norm_code(code))}__bs{int(bar_size)}__{day_token}.parquet"
+
+
+def _read_minute_cache(path: Path) -> Optional[pd.DataFrame]:
+    try:
+        if not path.exists():
+            return None
+        raw = pd.read_parquet(path)
+        if raw is None or raw.empty:
+            return None
+        fetch_code = ""
+        if "wind_fetch_code" in raw.columns:
+            vals = raw["wind_fetch_code"].dropna()
+            fetch_code = str(vals.iloc[-1]) if not vals.empty else ""
+            raw = raw.drop(columns=["wind_fetch_code"])
+        df = normalize_intraday_df(raw)
+        if df.empty:
+            return None
+        df.attrs["wind_fetch_code"] = fetch_code
+        return df
+    except Exception:
+        return None
+
+
+def _write_minute_cache(path: Path, df: pd.DataFrame) -> None:
+    """原子写入分钟 bar；额外记录实际使用的 Wind 代码，便于审计。落盘失败不阻断主流程。"""
+    try:
+        out = df.copy()
+        out["wind_fetch_code"] = df.attrs.get("wind_fetch_code", "") or ""
+        tmp = path.with_name(path.name + ".tmp")
+        out.to_parquet(tmp, index=False)
+        tmp.replace(path)
+    except Exception:
+        pass
 
 
 def ensure_wind() -> Any:
@@ -117,15 +244,19 @@ def normalize_intraday_df(df: Optional[pd.DataFrame]) -> pd.DataFrame:
     return data[["date", "high", "low", "close", "volume", "amount"]]
 
 
-def fetch_wind_daily_ohlcva(code: str, end_date: str, lookback_years: int = 3, price_adj: str = DEFAULT_PRICE_ADJ) -> pd.DataFrame:
+def _wsd_request_range(code: str, req_start: Any, req_end: Any, price_adj: str) -> pd.DataFrame:
+    """向 Wind 请求单个时间区间的日频 OHLCVA，返回规范化 DataFrame。"""
     w = ensure_wind()
-    code = norm_code(code)
-    end = pd.to_datetime(end_date)
-    start = end - pd.DateOffset(years=lookback_years)
     opt = f"PriceAdj={price_adj}" if str(price_adj or "").strip() else ""
     attempts = []
     for wind_code in wind_code_candidates(code):
-        r = w.wsd(wind_code, "high,low,close,volume,amt", start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d"), opt)
+        r = w.wsd(
+            wind_code,
+            "high,low,close,volume,amt",
+            pd.Timestamp(req_start).strftime("%Y-%m-%d"),
+            pd.Timestamp(req_end).strftime("%Y-%m-%d"),
+            opt,
+        )
         err = getattr(r, "ErrorCode", -1)
         if err != 0:
             attempts.append(f"{wind_code}: ErrorCode={err}")
@@ -144,6 +275,47 @@ def fetch_wind_daily_ohlcva(code: str, end_date: str, lookback_years: int = 3, p
     raise RuntimeError(
         f"Wind wsd failed/no data for {code}; tried {wind_code_candidates(code)}; details: {'; '.join(attempts)}"
     )
+
+
+def fetch_wind_daily_ohlcva(code: str, end_date: str, lookback_years: int = 3, price_adj: str = DEFAULT_PRICE_ADJ) -> pd.DataFrame:
+    code = norm_code(code)
+    end = pd.to_datetime(end_date).normalize()
+    start = (end - pd.DateOffset(years=lookback_years)).normalize()
+
+    # 未启用持久化缓存：保持原始行为，每次全量请求。
+    if not _DAILY_CACHE["enabled"]:
+        return _wsd_request_range(code, start, end, price_adj)
+
+    cache_path = _daily_cache_path(code, price_adj)
+    cached = None if _DAILY_CACHE["refresh"] else _read_daily_cache(cache_path)
+
+    if cached is None or cached.empty:
+        # 无缓存或强制刷新：取完整目标区间。
+        merged = _wsd_request_range(code, start, end, price_adj)
+    else:
+        parts: List[pd.DataFrame] = []
+        cmin = cached["date"].min()
+        cmax = cached["date"].max()
+        # 头部缺失（缓存最早日晚于目标起点）：补取早期区间。
+        if cmin > start:
+            parts.append(_wsd_request_range(code, start, cmin - pd.Timedelta(days=1), price_adj))
+        parts.append(cached)
+        # 尾部增量：从缓存最后日期起（含，重叠 1 天用于刷新近期数据）。
+        if cmax < end:
+            parts.append(_wsd_request_range(code, cmax, end, price_adj))
+        merged = (
+            pd.concat(parts, ignore_index=True)
+            .drop_duplicates(subset="date", keep="last")
+            .sort_values("date")
+            .reset_index(drop=True)
+        )
+
+    # 落盘完整缓存（长期累积，历史部分持续复用）。
+    _write_daily_cache(cache_path, merged)
+
+    # 切出本次目标窗口返回，结构与原函数一致。
+    result = merged[(merged["date"] >= start) & (merged["date"] <= end)].reset_index(drop=True)
+    return result
 
 
 
@@ -189,11 +361,25 @@ def fetch_wind_latest_raw_close(code: str, end_date: str, lookback_days: int = 1
 
 
 def fetch_wind_intraday_minute(code: str, date: str, bar_size: int = 1, price_adj: str = DEFAULT_PRICE_ADJ) -> pd.DataFrame:
-    """Fetch Wind minute bars, trying HK Wind code variants automatically."""
-    w = ensure_wind()
+    """Fetch Wind minute bars, trying HK Wind code variants automatically.
+
+    带分钟级持久化缓存：同一 (代码, bar_size, 交易日) 只要本地有非空 parquet 就直接返回，
+    不再消耗 WSI 配额；未命中才请求并落盘。
+    """
     code = norm_code(code)
+    bar_size = int(bar_size)
+    cache_path: Optional[Path] = None
+    if _MINUTE_CACHE["enabled"]:
+        cache_path = _minute_cache_path(code, bar_size, date)
+        if not _MINUTE_CACHE["refresh"]:
+            cached = _read_minute_cache(cache_path)
+            if cached is not None and not cached.empty:
+                return cached
+
+    w = ensure_wind()
     market = guess_market(code)
     parts = []
+    used_codes = []
     opt = f"BarSize={bar_size}"
     if str(price_adj or "").strip():
         opt += f";PriceAdj={price_adj}"
@@ -219,9 +405,14 @@ def fetch_wind_intraday_minute(code: str, date: str, bar_size: int = 1, price_ad
         if tmp is not None and not tmp.empty:
             tmp.attrs["wind_fetch_code"] = used_code
             parts.append(tmp)
+            used_codes.append(used_code)
     if not parts:
         return pd.DataFrame(columns=["date", "high", "low", "close", "volume", "amount"])
-    return normalize_intraday_df(pd.concat(parts, ignore_index=True))
+    result = normalize_intraday_df(pd.concat(parts, ignore_index=True))
+    result.attrs["wind_fetch_code"] = used_codes[-1] if used_codes else ""
+    if cache_path is not None and not result.empty:
+        _write_minute_cache(cache_path, result)
+    return result
 
 
 def load_table(path: str | Path) -> pd.DataFrame:
