@@ -244,11 +244,12 @@ def normalize_intraday_df(df: Optional[pd.DataFrame]) -> pd.DataFrame:
     return data[["date", "high", "low", "close", "volume", "amount"]]
 
 
-def _wsd_request_range(code: str, req_start: Any, req_end: Any, price_adj: str) -> pd.DataFrame:
+def _wsd_request_range(code: str, req_start: Any, req_end: Any, price_adj: str, allow_empty: bool = False) -> pd.DataFrame:
     """向 Wind 请求单个时间区间的日频 OHLCVA，返回规范化 DataFrame。"""
     w = ensure_wind()
     opt = f"PriceAdj={price_adj}" if str(price_adj or "").strip() else ""
     attempts = []
+    hard_errors = []
     for wind_code in wind_code_candidates(code):
         r = w.wsd(
             wind_code,
@@ -260,6 +261,7 @@ def _wsd_request_range(code: str, req_start: Any, req_end: Any, price_adj: str) 
         err = getattr(r, "ErrorCode", -1)
         if err != 0:
             attempts.append(f"{wind_code}: ErrorCode={err}")
+            hard_errors.append(wind_code)
             continue
         try:
             df = pd.DataFrame(np.array(r.Data).T, columns=["high", "low", "close", "volume", "amount"])
@@ -272,6 +274,10 @@ def _wsd_request_range(code: str, req_start: Any, req_end: Any, price_adj: str) 
             df.attrs["wind_fetch_code"] = wind_code
             return df
         attempts.append(f"{wind_code}: empty")
+    # 允许空（如次新股上市前区间）：仅当所有候选都 ErrorCode=0 但无数据时返回空表；
+    # 存在真实 ErrorCode 时仍按错误处理，避免吞掉配额/权限问题。
+    if allow_empty and not hard_errors:
+        return pd.DataFrame(columns=["date", "high", "low", "close", "volume", "amount"])
     raise RuntimeError(
         f"Wind wsd failed/no data for {code}; tried {wind_code_candidates(code)}; details: {'; '.join(attempts)}"
     )
@@ -297,8 +303,11 @@ def fetch_wind_daily_ohlcva(code: str, end_date: str, lookback_years: int = 3, p
         cmin = cached["date"].min()
         cmax = cached["date"].max()
         # 头部缺失（缓存最早日晚于目标起点）：补取早期区间。
+        # 次新股上市前区间 Wind 返回 ErrorCode=0 但无数据，allow_empty 容忍该空结果。
         if cmin > start:
-            parts.append(_wsd_request_range(code, start, cmin - pd.Timedelta(days=1), price_adj))
+            head = _wsd_request_range(code, start, cmin - pd.Timedelta(days=1), price_adj, allow_empty=True)
+            if not head.empty:
+                parts.append(head)
         parts.append(cached)
         # 尾部增量：从缓存最后日期起（含，重叠 1 天用于刷新近期数据）。
         if cmax < end:

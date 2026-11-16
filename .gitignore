@@ -218,3 +218,16 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# ===== 本项目特定规则 =====
+# 临时压缩包（可随时重新导出）
+*.zip
+
+# Office/WPS 打开 Excel 时产生的临时锁文件
+~$*.xlsx
+~$*.xls
+~$*.csv
+
+# 临时探针/诊断脚本与残留
+tempCodeRunnerFile.py
+_待导入/

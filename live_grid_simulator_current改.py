@@ -39,6 +39,8 @@ from data_loader import (
     fetch_wind_intraday_minute,
     configure_daily_cache,
     configure_minute_cache,
+    ensure_wind,
+    guess_market,
 )
 from features_daily import prepare_daily_features
 from grid_engine import evaluate_manager_grid_splitter
@@ -255,6 +257,52 @@ def find_initial_position_file(project_root: Path) -> str:
     return str(chosen) if chosen else ""
 
 
+def derive_business_date(asof_date: str, max_lookback_days: int = 10) -> str:
+    """从 asof 向前找最近工作日（周一到周五），不依赖 Wind，返回 YYYY-MM-DD。
+
+    用于目录/文件命名的业务日 D；旧口径网格 D 在 asof=D+1 时运行，
+    跨周末（asof 落在周六）也能正确回取到周五。
+    """
+    end = pd.to_datetime(asof_date, errors="coerce")
+    if pd.isna(end):
+        return ""
+    for lag in range(1, max(int(max_lookback_days), 1) + 1):
+        d = end - pd.Timedelta(days=lag)
+        if d.weekday() < 5:
+            return d.strftime("%Y-%m-%d")
+    return ""
+
+
+def resolve_run_layout(
+    project_root: Path,
+    replay_only: bool,
+    business_date: str,
+    arg_prefix: str,
+    output_dir: str = "",
+    state_dir: str = "",
+) -> Tuple[Path, Path, str]:
+    """按模式与业务日期解析最终输出/状态目录及文件前缀。
+
+    正常模式：outputs_live_grid改/网格{yyyymmdd}，state改/state{yyyymmdd}，前缀=网格{yyyymmdd}。
+    回放模式：outputs_replay_real/{yyyymmdd}，state_replay_real/{yyyymmdd}，前缀沿用调用方。
+    显式 --output-dir/--state-dir 优先（不追加日期子目录）。
+    """
+    root = Path(project_root)
+    token = pd.to_datetime(business_date).strftime("%Y%m%d")
+    if replay_only:
+        out_default = root / "outputs_replay_real" / token
+        state_default = root / "state_replay_real" / token
+        file_prefix = str(arg_prefix).strip() or f"回放{token}"
+    else:
+        grid_label = f"网格{token}"
+        out_default = root / "outputs_live_grid改" / grid_label
+        state_default = root / "state改" / f"state{token}"
+        file_prefix = grid_label
+    out_path = Path(output_dir).expanduser() if str(output_dir).strip() else out_default
+    state_path = Path(state_dir).expanduser() if str(state_dir).strip() else state_default
+    return out_path.resolve(), state_path.resolve(), file_prefix
+
+
 def resolve_runtime_inputs(args: argparse.Namespace) -> argparse.Namespace:
     root = project_root_from_args(args)
     ensure_live_project_folders(root)
@@ -266,7 +314,9 @@ def resolve_runtime_inputs(args: argparse.Namespace) -> argparse.Namespace:
         args.asof_date = normalize_date_token(args.asof_date)
 
     if not getattr(args, "instruction_file", ""):
-        args.instruction_file = str(find_latest_instruction_file(root, args.asof_date))
+        # 仅分钟回放直接读 active master、不依赖指令文件，故回放模式不强制查找。
+        if not bool(str(getattr(args, "replay_grid_file", "")).strip()):
+            args.instruction_file = str(find_latest_instruction_file(root, args.asof_date))
 
     if not getattr(args, "oplus_file", ""):
         oplus_date = getattr(args, "oplus_date", "") or ""
@@ -292,15 +342,17 @@ def resolve_runtime_inputs(args: argparse.Namespace) -> argparse.Namespace:
         args.hk_template = str(find_template_file(root, "HK"))
     if not getattr(args, "basket_template", ""):
         args.basket_template = str(find_basket_template_file(root))
-    # 默认输出和状态目录放在 live_grid_project 下面，方便每天复用 state。
-    if not getattr(args, "output_dir", ""):
-        args.output_dir = str(root / "outputs_live_grid")
-    if not getattr(args, "state_dir", ""):
-        if str(getattr(args, "replay_grid_file", "")).strip():
-            # 仅分钟回放只读复用网格，不污染主 state；未显式 --state-dir 时隔离到 state_replay。
-            args.state_dir = str(root / "state_replay")
-        else:
-            args.state_dir = str(root / "state")
+    # 目录按模式+业务日期规整：正常 -> outputs_live_grid改/网格日期 & state改/state日期；
+    # 回放 -> outputs_replay_real/日期 & state_replay_real/日期。显式 --output-dir/--state-dir 优先。
+    replay_only = bool(str(getattr(args, "replay_grid_file", "")).strip())
+    business_date = derive_business_date(args.asof_date)
+    out_resolved, state_resolved, file_prefix = resolve_run_layout(
+        root, replay_only, business_date, getattr(args, "prefix", ""),
+        getattr(args, "output_dir", ""), getattr(args, "state_dir", ""),
+    )
+    args.output_dir = str(out_resolved)
+    args.state_dir = str(state_resolved)
+    args.prefix = file_prefix
 
     # 默认采用“固定持仓基线重算”：每次都从 position_file 重新建立仓位，
     # 再完整应用本次指定的 Oplus 文件。只有显式启用
@@ -769,6 +821,11 @@ def export_basket_reference_template(
     for r in range(len(rows) + 2, ws.max_row + 1):
         for c in range(1, len(BASKET_TEMPLATE_HEADERS) + 1):
             ws.cell(r, c).value = None
+
+    # 无成交的空文件：清空循环会清掉样式行，这里在最后把价格类型写回第5列，
+    # 保证空文件也保留 f-指定价口径标记。
+    if not rows:
+        ws.cell(style_row, 5).value = price_type
 
     ws.sheet_view.topLeftCell = None
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1918,6 +1975,33 @@ def _execution_price_from_bar(row: pd.Series, side: str, limit_price: float, vol
     return float(px)
 
 
+_TRADING_DAY_CACHE: Dict[Tuple[str, str], bool] = {}
+
+
+def is_trading_day(code: str, date_str: str) -> bool:
+    """用 Wind 交易日历快速判断某日期是否为该标的所在市场的交易日。
+
+    港股用 HKEX 日历（能正确识别重阳节等休市日），A 股用默认日历。
+    日历查询失败时保守返回 True，不阻断后续分钟线获取的原有流程。
+    """
+    market = guess_market(code)
+    key = (market, date_str)
+    if key in _TRADING_DAY_CACHE:
+        return _TRADING_DAY_CACHE[key]
+    result = True
+    try:
+        w = ensure_wind()
+        opt = "TradingCalendar=HKEX" if market == "HK" else ""
+        r = w.tdays(date_str, date_str, opt)
+        if getattr(r, "ErrorCode", -1) == 0:
+            data = getattr(r, "Data", None)
+            result = bool(data and len(data[0]) > 0)
+    except Exception:
+        result = True
+    _TRADING_DAY_CACHE[key] = result
+    return result
+
+
 def fetch_previous_trading_minute_bars(
     code: str,
     asof_date: str,
@@ -1933,6 +2017,9 @@ def fetch_previous_trading_minute_bars(
         if d.weekday() >= 5:
             continue
         date_str = d.strftime("%Y-%m-%d")
+        # 休市日（如港股重阳节）先用交易日历快速跳过，避免对无数据日发起会超时的 WSI。
+        if not is_trading_day(code, date_str):
+            continue
         try:
             minute = fetch_wind_intraday_minute(code, date_str, bar_size=1, price_adj="")
         except Exception:
@@ -2265,7 +2352,7 @@ def main() -> int:
         raise ValueError("minute_lookback_days 至少为 1。")
 
     outdir = Path(args.output_dir).resolve()
-    state_dir = Path(args.state_dir).resolve() if args.state_dir else outdir / "state"
+    state_dir = Path(args.state_dir).resolve()
     outdir.mkdir(parents=True, exist_ok=True)
     state_dir.mkdir(parents=True, exist_ok=True)
 
@@ -2594,8 +2681,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--hk-template", default="", help="港股买卖清单导入模板.xlsx；不填则从 live_grid_project 根目录自动寻找")
     p.add_argument("--basket-template", default="", help="现货篮子指令参考模板.xlsx；不填则从项目根目录自动寻找")
     p.add_argument("--asof-date", default="", help="运行日期，例如 2026-06-23；不填默认今天")
-    p.add_argument("--output-dir", default="", help="输出目录；默认 live_grid_project/outputs_live_grid")
-    p.add_argument("--state-dir", default="", help="状态目录；默认 live_grid_project/state，建议不要随便删除")
+    p.add_argument("--output-dir", default="", help="输出目录；正常默认 outputs_live_grid改/网格日期，回放默认 outputs_replay_real/日期")
+    p.add_argument("--state-dir", default="", help="状态目录；正常默认 state改/state日期，回放默认 state_replay_real/日期")
     p.add_argument("--project-root", default="", help="项目根目录；默认当前 live_grid_simulator.py 所在文件夹")
     p.add_argument("--prefix", default="实盘网格", help="输出文件名前缀")
     p.add_argument("--sheets", default="股票指令", help="读取指令 sheet，逗号分隔；默认 股票指令")
