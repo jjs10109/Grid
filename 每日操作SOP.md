@@ -1,155 +1,95 @@
 # 每日网格操作 SOP（照着做即可）
 
-> **2026-10-16 重要更新**：日常跑法已从「纯增量 state」改为「**真实持仓基线**」。
-> 每天导入最新一份《全球产品持仓查询》，仓位直接读真实持仓，最准（实测 1014/1015 全产品 0 差异），
-> 并自动覆盖手动交易、货币基金利息、融券、美股 swap 等纯增量跟踪不到的情况。
+> 主力脚本：`live_grid_simulator_current改.py`。模拟产品=巨杉网格化，底层持仓=净值线3号。
+> 日常跑**正常模式**；只有需要重放某天真实分钟成交时才用**回放模式**。
 
-## 0. 目录结构
+## 0. 跑前准备
 
-```
-live_grid_project/
-├── 日常代码/                      ★ 入口脚本（每天跑的就是这几个）
-│   ├── import_daily_data.py
-│   ├── step1_filter.py
-│   └── step2_grid.py
-├── _待导入/                      收件箱：每天新文件全丢这里
-├── live_grid_simulator_sim.py    网格主程序（多产品版）
-├── oplus文件/                    Oplus 成交历史
-├── 指令/                         经理指令 + 剔除产物 + 补丁库
-├── 持仓数据/                      全球产品持仓查询文件
-├── state/                        运行状态（审计用，固定基线不依赖它算仓位）
-└── outputs_live_grid/            最终输出
-```
+- 确认 Wind 终端已登录（首次取数需要；缓存命中时不连 Wind）。
+- **关闭所有 Excel/WPS**，否则 `.xls` 持仓文件经 COM 转换会失败。
+- Python 固定用 `D:\anaconda3\python.exe`。
+- 缓存默认开启，无需额外操作。
 
 ---
 
-## 每天流程（四步）
+## 1. 正常模式（日常）
 
-### 第 1 步：导入当天数据
+在项目根目录执行。以业务日 1013 为例：
 
-当天下载的 **oplus 成交、最新全球持仓、新组合指令** 全丢进 `_待导入\`，然后：
-
-```bat
-cd /d C:\Users\gucao\Desktop\live_grid_project
-python 日常代码/import_daily_data.py
+```powershell
+& "D:\anaconda3\python.exe" ".\live_grid_simulator_current改.py" `
+  --asof-date 2026-10-14 `
+  --instruction-file ".\指令\组合指令1013_剔除已成交.xlsx" `
+  --oplus-file ".\oplus交易文件\oplus1012.xlsx" `
+  --position-file ".\持仓数据\全球产品持仓查询_20261012.xls" `
+  --no-apply-oplus-trades --price-band 0.30
 ```
 
-自动归位：oplus→`oplus文件\`、持仓→`持仓数据\`、指令→`指令\`。只想预览不移动加 `--dry-run`。
+### 六天参数对照（旧口径，已验证）
 
-### 第 2 步：剔除已成交 + 自动恢复历史手改
+| 业务日 | asof-date | oplus 文件 | 持仓文件 | 活跃网格/可模拟成交 |
+|---|---|---|---|---|
+| 1013 | 2026-10-14 | oplus1012 | 全球产品持仓查询_20261012 | 165 / 22 |
+| 1014 | 2026-10-15 | oplus1013 | 全球产品持仓查询_20261013 | 172 / 11 |
+| 1015 | 2026-10-16 | oplus1014 | 全球产品持仓查询_20261014 | 161 / 6 |
+| 1016 | 2026-10-17（周六） | oplus1015 | 全球产品持仓查询_20261015 | 156 / 8 |
+| 1019 | 2026-10-20 | oplus1016 | 全球产品持仓查询_20261016 | 129 / 6 |
+| 1020 | 2026-10-21 | oplus1019 | 全球产品持仓查询_20261019 | 133 / 9 |
 
-```bat
-python 日常代码/step1_filter.py
+口径要点：
+- **asof = 业务日 + 1**（含周末，asof 周六会自动回取周五工作日）。
+- oplus、持仓都取业务日的**前一交易日**文件。
+- 必加 `--no-apply-oplus-trades`（持仓已含前一天成交，不重复叠加）。
+- `--price-band 0.30` 只输出参考价 ±30% 内档位。
+
+跑完自动落 `outputs_live_grid改/网格{yyyymmdd}/`（9 文件）与 `state改/state{yyyymmdd}/`（4 文件）。
+
+---
+
+## 2. 回放模式（重放真实分钟成交）
+
+读正常模式已生成的 active master，跳过 WSD 建网格，只重放当天分钟线。以 1013 为例：
+
+```powershell
+& "D:\anaconda3\python.exe" ".\live_grid_simulator_current改.py" `
+  --asof-date 2026-10-14 `
+  --instruction-file ".\指令\组合指令1013_剔除已成交.xlsx" `
+  --replay-grid-file ".\state改\state20261013\active_grid_master.xlsx" `
+  --position-file ".\持仓数据\全球产品持仓查询_20261012.xls" `
+  --no-apply-oplus-trades `
+  --prefix "回放1013真实成交"
 ```
 
-做两件事：① 用 oplus 成交把已成交指令剔除，生成 `_剔除已成交.xlsx`；② 把你以前的人工修正自动恢复。
+跑完自动落 `outputs_replay_real/{yyyymmdd}/` 与 `state_replay_real/{yyyymmdd}/`。
 
-### 第 3 步：人工核对 + 手改
-
-打开 `指令\` 下最新的 `组合指令XXXX_剔除已成交.xlsx`，按核对结果增删指令，保存。
-
-> **只改这个 xlsx**，旁边的 `_累计成交进度.csv` 是给你看的，网格程序不读、不要改。
-> 手改会被第 4 步自动记住，下次不用再改。
-
-### 第 4 步：学习手改 + 跑网格（全产品，含净值 + 流动性模拟）
-
-盘前跑当天网格，用**前一交易日收盘后的最新全球持仓**（它已包含前一天成交，所以加 `--no-apply-oplus-trades`，不再叠加 oplus）：
-
-```bat
-python 日常代码/step2_grid.py --asof-date 2026-10-15 --oplus-date 1014 --position-file "持仓数据/全球产品持仓查询_20261014.xls" --instruction-file "指令/组合指令1013_剔除已成交.xlsx" --no-apply-oplus-trades
-```
-
-跑完去 `outputs_live_grid\` 拿 A股/港股「本次新增网格」买卖清单导入 Oplus。
-
-> `step2_grid.py` 默认已加 `--price-band 0.30`，不用手写。
-> 如果忘了加 `--no-apply-oplus-trades`、而持仓又已包含当天成交，程序会打印「⚠ 日期重叠提醒」，看到提醒请中断并补上该参数重跑。
+> 回放必须显式传对应日期的 `--instruction-file`，不能留空。
+> PowerShell 里变量后直接接中文要用 `${变量}` 界定，例如 `--prefix "回放${short}真实成交"`。
 
 ---
 
-## 日期怎么填（关键）
+## 3. 结果核对
 
-以「**盘前跑 D 日网格**」为例：
-
-| 参数 | 填什么 | 示例（跑 10/15） |
-|------|--------|------|
-| `--asof-date` | 要跑的交易日 D | `2026-10-15` |
-| `--position-file` | **D-1 收盘后**的最新全球持仓（仓位权威） | `持仓数据/全球产品持仓查询_20261014.xls` |
-| `--oplus-date` | 前一交易日 D-1（仅用于 step1 剔除，第4步不叠加） | `1014` |
-| `--instruction-file` | step1 生成的最新剔除版指令（可能是 D-1 那份） | `指令/组合指令1013_剔除已成交.xlsx` |
-| `--no-apply-oplus-trades` | **盘前必加**：持仓已含 D-1 成交，不重复叠加 |  |
-
-> 注意：**以持仓文件内部日期为准，不是文件名日期**。例如 `全球产品持仓查询_20261008.xls` 内部日期是 9/30（国庆前最后交易日）。
+- 打开输出目录里的 `{前缀}_复核报告.xlsx`，看 `liquidity_sim_audit`（成交审计）和 `errors`：六天 errors 全 0。
+- 可导入文件的价格类型应全为 **`f-指定价`**。
+- 与 `oplus交易文件/oplus{业务日}.xlsx` 逐笔对照（证券代码、委托方向、成交数量、成交均价）。六天回放与正常模式成交逐笔一致。
+- 注意 oplus 的"最新价"列是导出时点现价，不一定是业务当天价；以"成交均价"核对业务当天真实价。
 
 ---
 
-## 一句话节奏
+## 4. 本地缓存
 
-**全丢 `_待导入\` → `import_daily_data.py` → `step1_filter.py` → 改 xlsx → `step2_grid.py ... --no-apply-oplus-trades`**
-
----
-
-## 常用变体
-
-### 只跑单个产品（不用另存指令文件）
-
-```bat
-python 日常代码/step2_grid.py --asof-date 2026-10-15 --oplus-date 1014 --position-file "持仓数据/全球产品持仓查询_20261014.xls" --instruction-file "指令/组合指令1013_剔除已成交.xlsx" --no-apply-oplus-trades --product "净值线3号"
-```
-
-多个产品逗号分隔：`--product "净值线3号,申新8号"`。
-
-### 快速跑（不要流动性模拟，速度快很多）
-
-```bat
-python 日常代码/step2_grid.py ... --no-apply-oplus-trades --disable-liquidity-simulation
-```
-
-### 指令没变，只刷新行情价格
-
-```bat
-python 日常代码/step2_grid.py ... --no-apply-oplus-trades --full-refresh
-```
-
-### 特殊补算：持仓日早于目标日、中间隔着 oplus 成交（不常用）
-
-只有在「手上的持仓文件比目标日旧、中间确实有 oplus 成交要补上」时，才**不加** `--no-apply-oplus-trades`。
-但要注意 oplus 是跨天累计快照，正确做法是：用持仓日当天的 oplus 先建快照（只记录、不加），再只加后续增量，否则跨天指令会重复。
-日常盘前用不到，遇到时单独处理。
+- 分钟线 `minute_cache/`（407 parquet）、日线 `wind_cache/`（41 parquet），默认先查本地。
+- 同参数二次运行全部命中缓存、不再连 Wind。
+- 强制重取：`--refresh-minute-cache` / `--refresh-wind-cache`；关闭缓存：`--no-minute-cache` / `--no-wind-cache`。
 
 ---
 
-## 手改记忆机制
+## 5. 版本管理（本地）
 
-- 同一份指令只需改**新出现**的问题，老问题 step1 自动恢复
-- 经理下发**全新指令**后，旧补丁不再适用，重新人工过一遍即可
-- 查看/撤销手改：打开 `指令\人工指令补丁.csv`，删行即撤销
-
----
-
-## 已内置的安全规则（不用手动管）
-
-- **swap/互换单元不生成 A股/港股网格**：广发swap、中金互换等单元只做美股/场外互换，不通过 Oplus 交易 A股/港股，自动跳过。
-- **纯融券空头不生成多头买入网格**：两仪1号等两融账户里，只有融券、没有多头的股票，不会被误当成「零多头」去开多头（空头网格如需开发另行处理）。
-- **同一代码既有多仓又有融券**：多头网格仍按真实多仓比例正常生成。
-- **所有导出 Excel 无冻结窗格**。
-
----
-
-## 输出文件说明
-
-| 文件 | 用途 |
-|------|------|
-| `实盘网格_A股_本次新增网格_买卖清单导入.xlsx` | **主要交付**：导入 Oplus 的新增档位 |
-| `实盘网格_港股_本次新增网格_买卖清单导入.xlsx` | 同上（港股） |
-| `实盘网格_A股/港股_当前全部网格_买卖清单导入.xlsx` | 当前全部在挂网格 |
-| `实盘网格_复核报告.xlsx` | 13 个 sheet：run_meta、product_navs(净值)、current_positions(持仓)、position_check(含跳过原因)、流动性、errors |
-| `实盘网格_昨日分钟流动性模拟.xlsx` | 3 个子表：可模拟成交网格、逐档成交核实、分钟流动性概览 |
-| `实盘网格_基金经理格式_当前全部网格.xlsx` | 经理格式查看 |
-
----
-
-## 环境与注意
-
-- 用 Anaconda Python（`D:\anaconda3\python.exe`，含 pywin32 + WindPy），运行时需连上 Wind 终端。
-- 跑批前**关闭所有 Excel**，否则持仓文件可能读取失败。
-- 周末/节假日没有 oplus 成交属正常，`oplus文件/` 里没有当天文件时程序会自动跳过。
+- 跑完确认无误后，在本地提交形成版本：
+  ```powershell
+  git add -A
+  git commit -m "说明本次改动"
+  ```
+- **不要自动推送**。只有明确收到"上传/推送到 GitHub"指令时才执行 `git push`。
+- 需要回退用 `git log --oneline` 找到提交号，再 `git reset --hard 提交号` 或 `git checkout HEAD -- 文件`。

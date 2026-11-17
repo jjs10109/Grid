@@ -1,5 +1,36 @@
 # 清理与修复记录
 
+## 2026-11 月：目录重构、日级缓存、回放隔离与 git 管理
+
+### 目录按日期规整（纯函数 + TDD）
+- 新增两个不依赖 Wind 的纯函数：`derive_business_date(asof)`（从 asof 向前找最近工作日）、
+  `resolve_run_layout(...)`（返回 out_path/state_path/file_prefix）。
+- 正常模式默认落 `outputs_live_grid改/网格{token}`、`state改/state{token}`；
+  回放模式默认落 `outputs_replay_real/{token}`、`state_replay_real/{token}`。
+- 显式 `--output-dir/--state-dir` 优先，且不追加日期子目录。
+- 先写 `test_layout.py`（14 项）确认失败，再实现，测试全通过。
+
+### 回放模式
+- 新增 `--replay-grid-file`：从指定 `active_grid_master.xlsx` 读网格，跳过 WSD 建网格。
+- 回放模式不强制按 asof 自动查找指令；但仍需显式传 `--instruction-file`（空串会导致 snapshot 报错）。
+- 六天回放成交与正常模式逐笔一致、价格类型全 f-指定价、errors 全 0。
+
+### 本地缓存
+- 分钟级 `minute_cache/`（407 parquet）：命中本地非空缓存直接返回，未命中才请求 WSI 并原子落盘，空结果不落盘。
+- 日级 `wind_cache/`（41 parquet）：WSD 同样先查缓存，配额异常抛错而非写空缓存。
+- 新增参数：`--no-minute-cache/--refresh-minute-cache/--minute-cache-dir`、
+  `--no-wind-cache/--refresh-wind-cache/--cache-dir`；新增 `prefetch_minute_cache.py` 批量预取。
+
+### 现货篮子
+- 现货篮子模板可导入文件（含空文件）价格类型统一为 f-指定价。
+
+### 版本管理
+- 初始化 git（main 分支），配置 `.gitignore`；缓存与产物纳入版本管理。
+- 本地提交与推送分开，未明确"上传"不执行 push。
+
+### 验证
+- 六天（1013/1014/1015/1016/1019/1020）正常 + 回放：成交逐笔差异 0、f-指定价、errors 全 0。
+
 ## 2026-10-19：网格价格逐只 Wind 核对 + 项目清理
 
 ### 新增对账工具
