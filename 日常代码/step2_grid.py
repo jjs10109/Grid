@@ -7,7 +7,7 @@
 
 它会依次执行：
     1) manual_patch.py --learn      把你刚才在 xlsx 里的手改记进补丁库
-    2) live_grid_simulator.py ...  按后面给的参数跑网格（参数透传）
+    2) live_grid_simulator_current改.py ...  跑网格并覆盖更新最新输出与汇总
 """
 from __future__ import annotations
 
@@ -34,13 +34,13 @@ def main() -> None:
     print("=" * 64)
     run([sys.executable, str(ROOT / "manual_patch.py"), "--learn"])
     print()
-    # 把用户传的所有参数原样透传给网格主程序（sim版，含流动性模拟）
+    # 把用户传的所有参数原样透传给当前主程序（含流动性模拟与比例汇总）
     grid_args = sys.argv[1:]
     # 默认价格带 ±30%（原版默认±10%太窄，会过滤掉大量档位）；用户显式传了则不覆盖
     if not any(a.startswith("--price-band") for a in grid_args):
         grid_args = ["--price-band", "0.30"] + grid_args
-    run([sys.executable, str(ROOT / "live_grid_simulator_sim.py"), *grid_args])
-    print("\n第 2 步完成。去 outputs_live_grid\\ 拿买卖清单。")
+    run([sys.executable, str(ROOT / "live_grid_simulator_current改.py"), *grid_args])
+    print("\n第 2 步完成。去 最新输出文件\\ 拿每日买卖清单和汇总指令。")
 
 
 if __name__ == "__main__":
