@@ -65,10 +65,25 @@ def baseline_path_of(filtered_path: Path) -> Path:
 
 
 # ---------------------------------------------------------------- 读补丁库
+def _read_patch_csv(path: Path) -> "pd.DataFrame":
+    """按编码优先级读取补丁 CSV：先 UTF-8（兼容带/不带 BOM），失败再回退 GBK。
+
+    Excel 在中文系统下另存 CSV 常得到 GBK/ANSI 无 BOM 文件，这里做兼容，
+    避免手动用 Excel 保存后再跑脚本时 UnicodeDecodeError。
+    """
+    last_error: Optional[Exception] = None
+    for enc in ("utf-8-sig", "gbk"):
+        try:
+            return pd.read_csv(path, dtype=str, encoding=enc)
+        except UnicodeDecodeError as exc:
+            last_error = exc
+    raise last_error
+
+
 def load_patches() -> pd.DataFrame:
     if not PATCH_CSV.exists():
         return pd.DataFrame(columns=PATCH_COLS)
-    df = pd.read_csv(PATCH_CSV, dtype=str).fillna("")
+    df = _read_patch_csv(PATCH_CSV).fillna("")
     for c in ["row", "col"]:
         if c in df.columns:
             df[c] = pd.to_numeric(df[c], errors="coerce").astype("Int64")
