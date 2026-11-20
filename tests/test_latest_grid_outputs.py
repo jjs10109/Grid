@@ -68,7 +68,7 @@ class RatioOutputTests(unittest.TestCase):
     def create_day(self, token, orders):
         folder = self.root / "outputs_live_grid改" / f"网格{token}"
         folder.mkdir(parents=True, exist_ok=True)
-        grid.save_excel_report(folder / f"网格{token}_复核报告.xlsx", {"current_positions": self.positions})
+        grid.save_excel_report(folder / f"网格{token}_复核报告.xlsx", {"current_positions": self.positions, "run_meta": pd.DataFrame([{"execution_policy": grid.POLICY_VERSION}])})
         grid.save_excel_report(folder / f"网格{token}_昨日分钟流动性模拟.xlsx", {"可模拟成交网格": orders})
         marker = folder / f"网格{token}_基金经理格式_当前全部网格.xlsx"
         shutil.copy2(self.template, marker)
@@ -102,6 +102,14 @@ class RatioOutputTests(unittest.TestCase):
         result = refresh_latest_outputs(self.root, engine=grid)
         self.assertEqual(result["counts"], {"A股": 0, "港股": 0})
         self.assertEqual(self.rows(result["paths"]["港股"]), [])
+
+    def test_old_policy_does_not_enter_new_summary(self):
+        self.create_day("20261013", self.orders())
+        old = self.create_day("20261014", self.orders())
+        grid.save_excel_report(old / "网格20261014_复核报告.xlsx", {"current_positions": self.positions, "run_meta": pd.DataFrame([{"execution_policy": "old"}])})
+        result = refresh_latest_outputs(self.root, engine=grid)
+        self.assertEqual(result["counts"]["港股"], 3)
+        self.assertEqual(result["excluded_dates"], ["20261014"])
 
 
 if __name__ == "__main__":

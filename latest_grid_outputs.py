@@ -50,6 +50,23 @@ def refresh_latest_outputs(
     if not reports:
         raise FileNotFoundError(f"没有找到 {start.date()} 起的正常模式复核报告，未覆盖汇总。")
 
+    from manager_execution_policy import POLICY_VERSION
+    compatible = {}
+    excluded_dates = []
+    for token, report in reports.items():
+        try:
+            meta = pd.read_excel(report, sheet_name="run_meta")
+            valid = not meta.empty and meta.iloc[0].get("execution_policy") == POLICY_VERSION
+        except ValueError:
+            valid = False
+        if valid:
+            compatible[token] = report
+        else:
+            excluded_dates.append(token)
+    reports = compatible
+    if not reports:
+        raise ValueError("现有历史文件尚未按经理档位手工/90%规则重建，未更新汇总；请先重跑正常网格。")
+
     combined: dict[str, list[list[Any]]] = {"A股": [], "港股": []}
     provenance = []
     days = []
@@ -125,7 +142,12 @@ def refresh_latest_outputs(
         paths[market] = path
     columns = ["市场", "业务日期", "汇总Excel行号", "每日文件", "每日Excel行号", "证券代码", "委托方向", "净值比例(%)"]
     engine.save_csv_atomic(pd.DataFrame(provenance, columns=columns), summary_dir / "汇总来源.csv")
-    return {"folder": latest, "start_date": start.strftime("%Y-%m-%d"), "end_date": max(reports), "days": days, "paths": paths, "counts": {market: len(rows) for market, rows in combined.items()}}
+    most_recent_manual = latest / f"网格{max(reports)}" / f"网格{max(reports)}_手工下单文件.xlsx"
+    if most_recent_manual.exists():
+        shutil.copy2(most_recent_manual, latest / "手工下单文件.xlsx")
+    if excluded_dates:
+        print(f"以下旧规则日期未混入最新汇总，需重建：{', '.join(sorted(excluded_dates))}")
+    return {"folder": latest, "start_date": start.strftime("%Y-%m-%d"), "end_date": max(reports), "days": days, "paths": paths, "excluded_dates": sorted(excluded_dates), "counts": {market: len(rows) for market, rows in combined.items()}}
 
 
 def main() -> int:
