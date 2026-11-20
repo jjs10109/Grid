@@ -45,6 +45,7 @@ from data_loader import (
 from features_daily import prepare_daily_features
 from grid_engine import evaluate_manager_grid_splitter
 from instruction_reader import parse_instruction_excel
+from manager_execution_policy import apply_manager_execution_policy, manual_order_table, export_manual_order_file, POLICY_VERSION
 
 TEMPLATE_HEADERS = ["证券代码", "证券名称", "产品名称", "单元名称", "交易市场", "委托方向", "数量/仓位", "极限价格"]
 BASKET_TEMPLATE_HEADERS = ["证券代码", "证券名称", "交易市场", "委托方向", "价格类型", "指令价格", "指令数量", "指令金额", "净值比例(%)"]
@@ -1652,6 +1653,10 @@ def build_orders_for_code(
     sell_levels_raw = row.get("sell_levels") or []
     instruction_id = str(row.get("instruction_hash", ""))
 
+    if len({float(x["price"]) for x in buy_levels_raw}) < 2 and len({float(x["price"]) for x in sell_levels_raw}) < 2:
+        # 没有两个原始档位就没有中间自动网格；手工清单独立生成，不依赖行情。
+        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+
     # D 日网格只能使用 Oplus 日（通常 D-1）及以前的历史行情，避免历史重跑前视。
     profile = fetch_daily_profile_cached(code, market_data_date, args.lookback_years, args.price_adj, daily_cache)
 
@@ -1713,15 +1718,18 @@ def build_orders_for_code(
 
         side_tables = []
         if res.get("buy_table") is not None and not res["buy_table"].empty:
-            t = res["buy_table"].copy()
+            t = apply_manager_execution_policy(res["buy_table"], buy_levels, "buy")
             t["side"] = "buy"
-            t["source_basis"] = t.apply(lambda z: source_basis_for_row(z, buy_levels), axis=1)
+            if not t.empty:
+                t["source_basis"] = t.apply(lambda z: source_basis_for_row(z, buy_levels), axis=1)
             side_tables.append(t)
         if res.get("sell_table") is not None and not res["sell_table"].empty:
-            t = res["sell_table"].copy()
+            t = apply_manager_execution_policy(res["sell_table"], sell_levels, "sell")
             t["side"] = "sell"
-            t["source_basis"] = t.apply(lambda z: source_basis_for_row(z, sell_levels), axis=1)
+            if not t.empty:
+                t["source_basis"] = t.apply(lambda z: source_basis_for_row(z, sell_levels), axis=1)
             side_tables.append(t)
+        side_tables = [t for t in side_tables if not t.empty]
         if not side_tables:
             continue
 
@@ -1782,6 +1790,8 @@ def build_orders_for_code(
                     "position_after_level": after_pos,
                     "source_basis": lvl.get("source_basis", ""),
                     "is_manager_level": bool(lvl.get("is_manager_level", False)),
+                    **{k: lvl.get(k) for k in ["execution_policy", "manual_policy_interval", "manager_start_price", "manager_end_price",
+                                                "manager_start_target", "manager_end_target", "automatic_completion"]},
                     "instruction_hash": instruction_id,
                     "dedupe_key": key,
                     "pass_position_check": valid,
@@ -2456,6 +2466,8 @@ def main() -> int:
     active_master_path = state_dir / "active_grid_master.xlsx"
     ledger_path = state_dir / "delta_ledger.xlsx"
     prev_active = load_active_master(active_master_path)
+    if not prev_active.empty and ("execution_policy" not in prev_active or not prev_active["execution_policy"].eq(POLICY_VERSION).all()):
+        args.full_refresh = True
 
     if baseline_recompute:
         # 固定基线重算时，旧 snapshot/active master 不能参与决定本次计算范围。
@@ -2580,6 +2592,14 @@ def main() -> int:
             active_master = active_master[active_master["product"] == SIM_PRODUCT_NAME].copy()
             active_master = active_master.drop_duplicates(subset=["dedupe_key"], keep="last")
 
+    # 包括旧增量状态与旧回放网格：缺少新规则标记时不能继续执行经理原始档位。
+    if not active_master.empty and ("execution_policy" not in active_master or not active_master["execution_policy"].eq(POLICY_VERSION).all()):
+        raise ValueError("旧网格尚未应用经理档位手工执行/90%规则，请先正常模式全量重建后再增量或回放。")
+
+    manual_orders = manual_order_table(snapshot, accounts, positions, active_master, derive_business_date(args.asof_date), sys.modules[__name__])
+    manual_path = outdir / f"{args.prefix}_手工下单文件.xlsx"
+    export_manual_order_file(manual_orders, manual_path, sys.modules[__name__])
+
     ledger_out = pd.concat([ledger if ledger is not None else pd.DataFrame(), new_orders], ignore_index=True)
     if not ledger_out.empty and "dedupe_key" in ledger_out.columns:
         ledger_out = ledger_out.drop_duplicates(subset=["dedupe_key"], keep="first")
@@ -2613,6 +2633,7 @@ def main() -> int:
     report_path = outdir / f"{args.prefix}_复核报告.xlsx"
     run_meta = pd.DataFrame([{
         "calculation_mode": "baseline_recompute" if baseline_recompute else "incremental_state",
+        "execution_policy": POLICY_VERSION,
         "position_file": str(args.position_file or ""),
         "oplus_file": str(args.oplus_file or ""),
         "instruction_file": str(args.instruction_file or ""),
@@ -2638,6 +2659,7 @@ def main() -> int:
         "liquidity_sim_audit": simulation_audit,
         "liquidity_minute_summary": simulation_minute_summary,
         "errors": errors_df,
+        "manual_orders": manual_orders,
     })
 
     active_a, active_hk = split_orders_by_market(active_master)
@@ -2663,6 +2685,7 @@ def main() -> int:
         simulated_hk, positions, sim_product_nav, args.basket_template, paths["simulated_hk_template"]
     )
     export_manager_instruction_style(active_master, paths["manager_instruction"])
+    print(f"经理原始档位手工清单：{manual_path}")
 
     if not replay_only:
         from latest_grid_outputs import refresh_latest_outputs
