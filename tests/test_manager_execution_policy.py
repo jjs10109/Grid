@@ -61,7 +61,7 @@ class ManagerPolicyTests(unittest.TestCase):
         accounts = pd.DataFrame([{"product": engine.SIM_PRODUCT_NAME, "unit": engine.SIM_UNIT_NAME}])
         positions = pd.DataFrame([{"product": engine.SIM_PRODUCT_NAME, "unit": engine.SIM_UNIT_NAME, "code": "600000.SH", "name": "示例", "current_pos": .01}])
         instruction = pd.Series({"code": "600000.SH", "name": "示例", "buy_levels": levels, "sell_levels": [], "instruction_hash": "test"})
-        args = SimpleNamespace(lookback_years=3, price_adj="F", split_method="linear", buy_gamma=1., sell_gamma=1., auto_split_buy_anchors=False, min_order_weight=0., force=False)
+        args = SimpleNamespace(lookback_years=3, price_adj="F", split_method="linear", buy_gamma=1., sell_gamma=1., auto_split_buy_anchors=False, min_order_weight=0., force=False, price_band_mode="fixed")
         with patch.object(engine, "fetch_daily_profile_cached", return_value=pd.DataFrame()), patch.object(engine, "evaluate_manager_grid_splitter", return_value={"buy_table": table}):
             active, new, checks = engine.build_orders_for_code(instruction, accounts, positions, "2026-11-20", .3, {"600000.SH": 10.5}, {}, args, set(), "2026-11-19")
         self.assertEqual(active.price.tolist(), [10.8, 10.6, 10.4, 10.2])

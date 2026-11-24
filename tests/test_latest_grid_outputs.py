@@ -66,9 +66,9 @@ class RatioOutputTests(unittest.TestCase):
             grid.export_basket_reference_template(orders, self.positions, 0., self.template, self.root / "bad.xlsx")
 
     def create_day(self, token, orders):
-        folder = self.root / "outputs_live_grid改" / f"网格{token}"
+        folder = self.root / "最新输出文件" / "聚砾1号" / f"网格{token}"
         folder.mkdir(parents=True, exist_ok=True)
-        grid.save_excel_report(folder / f"网格{token}_复核报告.xlsx", {"current_positions": self.positions, "run_meta": pd.DataFrame([{"execution_policy": grid.POLICY_VERSION}])})
+        grid.save_excel_report(folder / f"网格{token}_复核报告.xlsx", {"current_positions": self.positions, "run_meta": pd.DataFrame([{"execution_policy": grid.POLICY_VERSION, "simulation_product": grid.SIM_PRODUCT_NAME}])})
         grid.save_excel_report(folder / f"网格{token}_昨日分钟流动性模拟.xlsx", {"可模拟成交网格": orders})
         marker = folder / f"网格{token}_基金经理格式_当前全部网格.xlsx"
         shutil.copy2(self.template, marker)
@@ -84,12 +84,12 @@ class RatioOutputTests(unittest.TestCase):
         expected = self.rows(first["paths"]["港股"])
         self.assertEqual([row[8] for row in expected], [2., 1., 1.5, 2., 1., 1.5])
         self.assertEqual(self.rows(first["paths"]["A股"]), [])
-        self.assertFalse((self.root / "最新输出文件" / "网格20261012").exists())
-        self.assertTrue((self.root / "最新输出文件/网格20261013/网格20261013_基金经理格式_当前全部网格.xlsx").exists())
+        self.assertNotIn("20261012", [day["date"] for day in first["days"]])
+        self.assertTrue((self.root / "最新输出文件/聚砾1号/网格20261013/网格20261013_基金经理格式_当前全部网格.xlsx").exists())
         second = refresh_latest_outputs(self.root, engine=grid)
         self.assertEqual(second["counts"], first["counts"])
         self.assertEqual(self.rows(second["paths"]["港股"]), expected)
-        provenance = pd.read_csv(self.root / "最新输出文件/汇总指令/汇总来源.csv")
+        provenance = pd.read_csv(self.root / "最新输出文件/聚砾1号/汇总指令/汇总来源.csv")
         self.assertEqual(provenance["业务日期"].tolist(), ["2026-10-13"] * 3 + ["2026-10-14"] * 3)
         # 显式本次运行可替换同日旧结果，汇总须缩短并清除旧尾行。
         folder = self.create_day("20261014", self.orders().iloc[:1])

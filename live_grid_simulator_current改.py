@@ -45,6 +45,7 @@ from data_loader import (
 from features_daily import prepare_daily_features
 from grid_engine import evaluate_manager_grid_splitter
 from instruction_reader import parse_instruction_excel
+from snapshot_guard import validate_snapshot_date
 from manager_execution_policy import apply_manager_execution_policy, manual_order_table, export_manual_order_file, POLICY_VERSION
 
 TEMPLATE_HEADERS = ["证券代码", "证券名称", "产品名称", "单元名称", "交易市场", "委托方向", "数量/仓位", "极限价格"]
@@ -223,7 +224,7 @@ def find_basket_template_file(project_root: Path) -> Path:
     return chosen
 
 
-def find_initial_position_file(project_root: Path) -> str:
+def find_initial_position_file(project_root: Path, cutoff: str = "") -> str:
     holdings_dir = project_root / "持仓数据"
     snapshots = [
         p for p in holdings_dir.glob("全球产品持仓查询_*.xls*")
@@ -238,6 +239,9 @@ def find_initial_position_file(project_root: Path) -> str:
             snapshot_date = datetime.min
         return snapshot_date, path.stat().st_mtime, path.name
 
+    if cutoff:
+        limit = pd.to_datetime(cutoff).to_pydatetime()
+        snapshots = [p for p in snapshots if snapshot_sort_key(p)[0] <= limit]
     latest_snapshot = max(
         snapshots,
         key=snapshot_sort_key,
@@ -291,13 +295,13 @@ def resolve_run_layout(
     root = Path(project_root)
     token = pd.to_datetime(business_date).strftime("%Y%m%d")
     if replay_only:
-        out_default = root / "outputs_replay_real" / token
-        state_default = root / "state_replay_real" / token
+        out_default = root / "最新输出文件" / "聚砾1号回放" / token
+        state_default = root / "运行状态" / "聚砾1号回放" / token
         file_prefix = str(arg_prefix).strip() or f"回放{token}"
     else:
         grid_label = f"网格{token}"
-        out_default = root / "最新输出文件" / grid_label
-        state_default = root / "state改" / f"state{token}"
+        out_default = root / "最新输出文件" / "聚砾1号" / grid_label
+        state_default = root / "运行状态" / "聚砾1号" / f"state{token}"
         file_prefix = grid_label
     out_path = Path(output_dir).expanduser() if str(output_dir).strip() else out_default
     state_path = Path(state_dir).expanduser() if str(state_dir).strip() else state_default
@@ -360,10 +364,10 @@ def resolve_runtime_inputs(args: argparse.Namespace) -> argparse.Namespace:
     # --incremental-state-mode 时，才允许沿用 state/current_positions.csv。
     state_position_path = Path(args.state_dir).expanduser().resolve() / "current_positions.csv"
     if not getattr(args, "position_file", ""):
-        if getattr(args, "incremental_state_mode", False) and state_position_path.exists():
+        if False:  # 旧比例状态不再作为仓位来源
             args.position_file = ""
         else:
-            args.position_file = find_initial_position_file(root)
+            args.position_file = find_initial_position_file(root, derive_business_date(derive_business_date(args.asof_date)))
 
     print("\n========== 本次读取文件 ==========")
     print(f"项目目录：{root}")
@@ -381,16 +385,16 @@ def resolve_runtime_inputs(args: argparse.Namespace) -> argparse.Namespace:
     print(f"状态目录：{args.state_dir}")
     return args
 
-SIM_SOURCE_PRODUCT_NAMES = {"净值线3号", "巨杉资产净值线3号"}
-SIM_PRODUCT_NAME = "巨杉网格化"
+SIM_SOURCE_PRODUCT_NAMES = {"聚砾1号", "巨杉资产聚砾1号"}
+SIM_PRODUCT_NAME = "聚砾网格模拟"
 SIM_UNIT_NAME = "单元"
 SIM_DEFAULT_PARTICIPATION_RATE = 0.01
 # 现实成交回放：默认只占单只股票每分钟市场成交量的 1%，所有网格共享该容量。
 
 PRODUCT_ALIAS = {
     "巨杉资产净值线1号": "净值线1号",
-    "巨杉资产净值线3号": SIM_PRODUCT_NAME,
-    "净值线3号": SIM_PRODUCT_NAME,
+    "巨杉资产聚砾1号": SIM_PRODUCT_NAME,
+    "聚砾1号": SIM_PRODUCT_NAME,
     "巨杉资产鸿6号": "鸿6号",
     "巨杉资产鸿7号": "鸿7号",
     "巨杉资产民生4号": "巨杉资产民生4号",
@@ -560,12 +564,12 @@ def normalize_product_name(x: Any) -> str:
 
 
 def is_sim_product(x: Any) -> bool:
-    """本模拟只使用净值线3号，并在系统内统一命名为“巨杉网格化”。"""
+    """本模拟只使用聚砾1号，并在系统内统一命名为“巨杉网格化”。"""
     return normalize_product_name(x) == SIM_PRODUCT_NAME
 
 
 def normalize_unit_name(x: Any) -> str:
-    """单产品模拟不再区分真实交易单元，所有净值线3号仓位/成交统一归并到“单元”。"""
+    """单产品模拟不再区分真实交易单元，所有聚砾1号仓位/成交统一归并到“单元”。"""
     return SIM_UNIT_NAME
 
 
@@ -643,7 +647,7 @@ def read_template_accounts(template_path: str | Path) -> pd.DataFrame:
 def load_template_accounts(a_template: str | Path, hk_template: str | Path) -> pd.DataFrame:
     """
     模拟环境固定为一个产品、一个单元：
-        净值线3号 -> 巨杉网格化 / 单元
+        聚砾1号 -> 巨杉网格化 / 单元
 
     交易模板只负责提供格式，不再从模板中的产品/单元行推导账户，
     因而不会因为模板仍保留历史产品名称而把网格拆成多个单元。
@@ -1052,7 +1056,7 @@ def load_oplus_trades(oplus_file: str | Path) -> Tuple[pd.DataFrame, Dict[str, f
 
         product = normalize_product_name(r.get(product_col))
         unit = normalize_unit_name(r.get(unit_col)) if unit_col else ""
-        # 只把净值线3号（系统内映射为“巨杉网格化”）的成交计入模拟持仓。
+        # 只把聚砾1号（系统内映射为“巨杉网格化”）的成交计入模拟持仓。
         if product != SIM_PRODUCT_NAME:
             continue
         direction_raw = str(r.get(direction_col, "")).strip()
@@ -1094,10 +1098,9 @@ def load_oplus_trades(oplus_file: str | Path) -> Tuple[pd.DataFrame, Dict[str, f
         business_date = str(r.get(business_date_col, "") if business_date_col else "").strip()
         order_time = str(r.get(order_time_col, "") if order_time_col else "").strip()
         # 优先用 Oplus 指令序号；缺失时加入日期、时间和原始行号，至少保证同文件重跑稳定。
-        identity = order_id or f"row={row_no}"
+        identity = order_id if order_id.lower() not in {"", "nan", "none", "混合"} else f"{business_date}|{order_time}|row={row_no}"
         trade_key = _stable_trade_key([
-            business_date, order_time, identity, product, unit, code, direction,
-            round(ratio, 10), str(r.get(remark_col, "") if remark_col else "").strip(),
+            identity, product, unit, code, direction,
         ])
         rows.append({
             "trade_key": trade_key,
@@ -1135,27 +1138,8 @@ def incremental_oplus_trades(
     current_trades: pd.DataFrame,
     previous_state: pd.DataFrame,
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    """把 Oplus 累计成交进度转换成相对上次运行的新增成交。"""
-    if current_trades is None or current_trades.empty:
-        return pd.DataFrame(columns=list(current_trades.columns) if current_trades is not None else []), previous_state.copy()
-    cur = current_trades.copy()
-    prev = previous_state[["trade_key", "applied_delta_weight"]].copy() if previous_state is not None and not previous_state.empty else pd.DataFrame(columns=["trade_key", "applied_delta_weight"])
-    cur = cur.merge(prev, on="trade_key", how="left")
-    cur["applied_delta_weight"] = pd.to_numeric(cur["applied_delta_weight"], errors="coerce").fillna(0.0)
-    cur["cumulative_delta_weight"] = pd.to_numeric(cur["trade_delta_weight"], errors="coerce").fillna(0.0)
-    cur["trade_delta_weight"] = cur["cumulative_delta_weight"] - cur["applied_delta_weight"]
-    incremental = cur[cur["trade_delta_weight"].abs() > 1e-12].copy()
-
-    state_cols = [c for c in current_trades.columns if c != "trade_delta_weight"]
-    current_state = current_trades.copy().rename(columns={"trade_delta_weight": "applied_delta_weight"})
-    current_state = current_state[["trade_key", "applied_delta_weight", *[c for c in state_cols if c != "trade_key"]]]
-    if previous_state is not None and not previous_state.empty:
-        keep_old = previous_state[~previous_state["trade_key"].isin(set(current_state["trade_key"]))].copy()
-        next_state = pd.concat([keep_old, current_state], ignore_index=True, sort=False)
-    else:
-        next_state = current_state
-    next_state = next_state.drop_duplicates(subset=["trade_key"], keep="last")
-    return incremental, next_state
+    """旧比例累计口径不具备可靠估值基础，禁止调用以免静默重复成交。"""
+    raise ValueError("已停用比例滚动增量；请读取同日聚砾真实持仓快照并刷新网格。股数账本需独立的股数/估值/汇率数据，不能用比例相减替代。")
 
 
 def save_csv_atomic(df: pd.DataFrame, path: Path) -> None:
@@ -1358,6 +1342,8 @@ def build_current_positions(
     只有 use_previous_state=True 且没有要求 reset 时，才沿用
     state/current_positions.csv 做跨日增量更新。
     """
+    if use_previous_state:
+        raise ValueError("旧比例状态禁止作为持仓来源，请使用聚砾真实快照。")
     previous = load_previous_positions(previous_position_path)
     if use_previous_state and not reset_position_state and not previous.empty:
         base = previous
@@ -1629,6 +1615,68 @@ def existing_keys_from_ledger(ledger: pd.DataFrame) -> set:
     return set(active["dedupe_key"].dropna().astype(str))
 
 
+def round_and_merge_levels(table: pd.DataFrame, digits: int) -> pd.DataFrame:
+    """把网格价四舍五入到指定小数位，并合并因此落到同一价格的相邻档。
+
+    同一限价只保留一条：买入取该价上更大的目标仓位（吸筹更充分），
+    卖出取更小的目标仓位（减仓更充分）；经理档属性优先保留。
+    """
+    if table is None or table.empty or digits is None or digits < 0:
+        return table
+    t = table.copy()
+    t["price"] = t["price"].round(digits)
+    merged_parts: List[pd.DataFrame] = []
+    for side, sub in t.groupby("side", sort=False):
+        agg_rows: List[Dict[str, Any]] = []
+        for price, grp in sub.groupby("price", sort=False):
+            has_mgr = "is_manager_level" in grp.columns and bool(grp["is_manager_level"].any())
+            if has_mgr:
+                base = grp[grp["is_manager_level"] == True].iloc[0].to_dict()
+            else:
+                base = grp.loc[grp["target_pos"].idxmax() if side == "buy" else grp["target_pos"].idxmin()].to_dict()
+            base["price"] = float(price)
+            base["target_pos"] = float(grp["target_pos"].max() if side == "buy" else grp["target_pos"].min())
+            if "is_manager_level" in grp.columns:
+                base["is_manager_level"] = has_mgr
+            agg_rows.append(base)
+        merged_parts.append(pd.DataFrame(agg_rows))
+    return pd.concat(merged_parts, ignore_index=True) if merged_parts else t
+
+def choose_single_side(
+    active_rows: Sequence[Dict[str, Any]], ref_price: float
+) -> Tuple[Optional[str], Dict[str, float]]:
+    """同代码同时存在买卖时，选距参考价更近的一侧；等距默认保留 sell（止盈降风险）。"""
+    sides = {str(r.get("side")) for r in active_rows}
+    if "buy" not in sides or "sell" not in sides:
+        return None, {}
+    dist: Dict[str, float] = {}
+    for side in ("buy", "sell"):
+        dist[side] = min(abs(float(r["price"]) - float(ref_price)) for r in active_rows if r.get("side") == side)
+    if dist["buy"] < dist["sell"] - 1e-10:
+        keep = "buy"
+    elif dist["sell"] < dist["buy"] - 1e-10:
+        keep = "sell"
+    else:
+        keep = "sell"
+    return keep, dist
+
+def board_price_band(code: Any) -> float:
+    """按股票板块/涨跌停性质返回带宽。
+
+    策略筛选带宽：主板10%；创业板/科创板20%；北交所30%；
+    港股固定30%。这是网格筛选参数，不是实际交易所涨跌停价校验。
+    """
+    c = canonical_code(code)
+    if c.endswith(".HK"):
+        return 0.30  # 港股无涨跌幅限制，固定 30%
+    if c.endswith(".BJ"):
+        return 0.30  # 北交所 ±30%
+    stem = c.split(".")[0]
+    if stem.startswith("688") or stem.startswith(("300", "301")):
+        return 0.20  # 科创板/创业板 ±20%
+    return 0.10
+
+
 def build_orders_for_code(
     row: pd.Series,
     accounts: pd.DataFrame,
@@ -1673,7 +1721,8 @@ def build_orders_for_code(
             f"{code} 没有可用参考价格：Oplus无有效最新价，Wind在 {market_data_date} 或此前也无未复权收盘价，"
             f"无法筛选上下 {price_band:.0%} 网格。"
         )
-    lo, hi = ref_price * (1 - price_band), ref_price * (1 + price_band)
+    effective_band = board_price_band(code) if getattr(args, "price_band_mode", "board") == "board" else float(price_band)
+    lo, hi = ref_price * (1 - effective_band), ref_price * (1 + effective_band)
 
     active_rows: List[Dict[str, Any]] = []
     new_rows: List[Dict[str, Any]] = []
@@ -1737,10 +1786,17 @@ def build_orders_for_code(
         table["price"] = pd.to_numeric(table["price"], errors="coerce")
         table["target_pos"] = pd.to_numeric(table["target_pos"], errors="coerce")
         table = table.dropna(subset=["price", "target_pos"])
+        table = round_and_merge_levels(table, int(getattr(args, "price_round_digits", 2)))
+        # 取整后再次排除原经理价格，避免中间档取整后落回手工档。
+        original_prices = {round(float(x["price"]), int(getattr(args, "price_round_digits", 2))) for x in buy_levels + sell_levels}
+        table = table[~table["price"].isin(original_prices)]
         table = table[(table["price"] >= lo - 1e-10) & (table["price"] <= hi + 1e-10)]
         if table.empty:
             continue
 
+        code_active_start = len(active_rows)
+        code_new_start = len(new_rows)
+        code_check_start = len(check_rows)
         for side, sub in table.groupby("side", sort=False):
             sub = sub.sort_values("price", ascending=(side == "sell")).copy()
             if side == "buy":
@@ -1812,7 +1868,20 @@ def build_orders_for_code(
                     running_pos = after_pos
                     if is_new:
                         new_rows.append(active_row)
-                        existing_keys.add(key)
+                        pass  # 单向筛选完成后才登记去重键
+
+        if not getattr(args, "allow_same_day_opposite", False):
+            kept, distances = choose_single_side(active_rows[code_active_start:], ref_price)
+            if kept:
+                active_rows[code_active_start:] = [r for r in active_rows[code_active_start:] if r["side"] == kept]
+                new_rows[code_new_start:] = [r for r in new_rows[code_new_start:] if r["side"] == kept]
+                for check in check_rows[code_check_start:]:
+                    if check["side"] != kept:
+                        check["suppressed_by_one_side_rule"] = True
+                        check["pass_position_check"] = False
+                        check["is_new_order"] = False
+                        check["skip_reason"] = "单向规则：另一方向距参考价更近（等距保留卖出）"
+        existing_keys.update(r["dedupe_key"] for r in new_rows[code_new_start:])
 
     return pd.DataFrame(active_rows), pd.DataFrame(new_rows), pd.DataFrame(check_rows)
 
@@ -1836,7 +1905,7 @@ def _find_market_value_col(columns: Iterable[Any]) -> Optional[str]:
 
 
 def infer_sim_product_nav(position_file: Optional[str | Path]) -> Tuple[float, str]:
-    """从全球持仓查询里推断“净值线3号/巨杉网格化”的产品净资产。
+    """从全球持仓查询里推断“聚砾1号/巨杉网格化”的产品净资产。
 
     优先用人民币持仓市值最大的有效持仓行，通过证券市值 / 持仓占净资产比例反推。
     返回 (nav, source)。若无法推断则返回 (nan, reason)。
@@ -2100,7 +2169,7 @@ def simulate_previous_day_execution(
         audit["first_fill_time"] = ""
         audit["last_fill_time"] = ""
         audit["simulation_status"] = "SKIP"
-        audit["simulation_reason"] = "无法获得巨杉网格化（净值线3号）的产品净资产"
+        audit["simulation_reason"] = "无法获得巨杉网格化（聚砾1号）的产品净资产"
         return pd.DataFrame(), audit[[c for c in audit_cols if c in audit.columns]], pd.DataFrame()
 
     participation_rate = float(np.clip(participation_rate, 0.0, 1.0))
@@ -2109,7 +2178,7 @@ def simulate_previous_day_execution(
     orders["order_weight"] = pd.to_numeric(orders["order_weight"], errors="coerce")
     orders = orders.dropna(subset=["price", "order_weight"]).copy()
 
-    # 当前真实仓位（净值线3号）用于将模拟部分成交重新折算为目标仓位。
+    # 当前真实仓位（聚砾1号）用于将模拟部分成交重新折算为目标仓位。
     pos_map: Dict[Tuple[str, str, str], float] = {}
     if positions is not None and not positions.empty:
         for _, r in positions.iterrows():
@@ -2361,6 +2430,8 @@ def main() -> int:
         cache_dir=getattr(args, "minute_cache_dir", "") or None,
     )
 
+    if not 0 <= args.price_round_digits <= 6:
+        raise ValueError("price-round-digits 必须在0到6之间。")
     if not (0.0 < float(args.price_band) < 1.0):
         raise ValueError("price_band 必须在 0 和 1 之间。")
     if float(args.min_order_weight) < 0:
@@ -2385,71 +2456,29 @@ def main() -> int:
 
     previous_position_path = state_dir / "current_positions.csv"
     oplus_state_path = state_dir / "oplus_trade_state.csv"
-    baseline_recompute = not args.incremental_state_mode
+    baseline_recompute = True
+    if not args.position_file:
+        raise FileNotFoundError("必须提供真实持仓快照，不能用旧比例状态替代。")
+    validate_snapshot_date(args.position_file, market_data_date)
+    positions = load_position_file(args.position_file, accounts)
+    if positions.empty:
+        raise ValueError("真实持仓中没有聚砾1号有效记录，禁止按零持仓继续生成网格。")
+    # 每次更新以真实快照为权威，成交进度仅审计；停止不可靠的比例滚动。
+    oplus_incremental = pd.DataFrame(columns=oplus_cumulative.columns)
+    print("持仓更新：重新读取聚砾真实快照；Oplus仅作参考与审计，不重复叠加。")
 
-    if baseline_recompute:
-        if not args.position_file:
-            raise FileNotFoundError(
-                "固定持仓基线重算模式必须提供 --position-file，或把名称含‘持仓’的 Excel 放在项目根目录。"
-            )
-        # 每次从同一持仓基线开始，因此应应用 Oplus 文件中的全部累计成交，
-        # 不能再减去上次运行记录，否则第二次运行会少算成交。
-        if args.no_apply_oplus_trades:
-            oplus_applied = pd.DataFrame(columns=oplus_cumulative.columns)
-        else:
-            oplus_applied = oplus_cumulative.copy()
-        positions = build_current_positions(
-            accounts=accounts,
-            position_file=args.position_file,
-            previous_position_path=previous_position_path,
-            oplus_trades=oplus_applied,
-            apply_oplus_trades=not args.no_apply_oplus_trades,
-            reset_position_state=True,
-            use_previous_state=False,
-        )
-        # 保存的状态只用于审计/查看，不作为下一次固定基线重算的输入。
-        save_csv_atomic(positions, previous_position_path)
-        if not args.no_apply_oplus_trades:
-            audit_state = oplus_cumulative.copy().rename(columns={"trade_delta_weight": "applied_delta_weight"})
-            if not audit_state.empty:
-                save_csv_atomic(audit_state, oplus_state_path)
-        oplus_incremental = oplus_applied
-    else:
-        previous_oplus_state = (
-            pd.DataFrame(columns=["trade_key", "applied_delta_weight"])
-            if args.reset_oplus_state
-            else load_oplus_trade_state(oplus_state_path)
-        )
-        if args.no_apply_oplus_trades:
-            oplus_incremental = pd.DataFrame(columns=oplus_cumulative.columns)
-            next_oplus_state = previous_oplus_state
-        else:
-            oplus_incremental, next_oplus_state = incremental_oplus_trades(oplus_cumulative, previous_oplus_state)
-        positions = build_current_positions(
-            accounts=accounts,
-            position_file=args.position_file,
-            previous_position_path=previous_position_path,
-            oplus_trades=oplus_incremental,
-            apply_oplus_trades=not args.no_apply_oplus_trades,
-            reset_position_state=args.reset_position_state,
-            use_previous_state=True,
-        )
-        save_csv_atomic(positions, previous_position_path)
-        if not args.no_apply_oplus_trades:
-            save_csv_atomic(next_oplus_state, oplus_state_path)
-
-    # 单产品模拟：净值线3号 -> 巨杉网格化。流动性模拟需要产品净资产来把仓位差换成股数。
+    # 单产品模拟：聚砾1号 -> 巨杉网格化。流动性模拟需要产品净资产来把仓位差换成股数。
     if float(args.sim_nav) > 0:
         sim_product_nav = float(args.sim_nav)
         sim_nav_source = "命令行 --sim-nav"
     else:
         sim_product_nav, sim_nav_source = infer_sim_product_nav(args.position_file)
     if np.isfinite(sim_product_nav) and sim_product_nav > 0:
-        print(f"模拟产品：{SIM_PRODUCT_NAME} / {SIM_UNIT_NAME}（底层持仓=净值线3号）")
+        print(f"模拟产品：{SIM_PRODUCT_NAME} / {SIM_UNIT_NAME}（底层持仓=聚砾1号）")
         print(f"模拟产品净资产：{sim_product_nav:,.2f}；来源={sim_nav_source}")
     else:
         print(f"WARNING: 无法自动得到 {SIM_PRODUCT_NAME} 净资产：{sim_nav_source}")
-        print("昨日分钟模拟成交需要基金净值计算固定数量；可用 --sim-nav 手动指定净资产。")
+        print("分钟流动性模拟内部需要估算净资产换算股数，导出仍使用交易比例；可用 --sim-nav 手动指定净资产。")
         if not args.disable_liquidity_simulation:
             raise ValueError(f"无法计算昨日分钟模拟成交所需基金净值：{sim_nav_source}")
 
@@ -2596,6 +2625,8 @@ def main() -> int:
     if not active_master.empty and ("execution_policy" not in active_master or not active_master["execution_policy"].eq(POLICY_VERSION).all()):
         raise ValueError("旧网格尚未应用经理档位手工执行/90%规则，请先正常模式全量重建后再增量或回放。")
 
+    if errors:
+        raise RuntimeError(f"生成失败，未保存新状态：{errors[:3]}")
     manual_orders = manual_order_table(snapshot, accounts, positions, active_master, derive_business_date(args.asof_date), sys.modules[__name__])
     manual_path = outdir / f"{args.prefix}_手工下单文件.xlsx"
     export_manual_order_file(manual_orders, manual_path, sys.modules[__name__])
@@ -2604,6 +2635,9 @@ def main() -> int:
     if not ledger_out.empty and "dedupe_key" in ledger_out.columns:
         ledger_out = ledger_out.drop_duplicates(subset=["dedupe_key"], keep="first")
 
+    if errors:
+        raise RuntimeError(f"{len(errors)}只股票生成失败，未提交状态或输出；请先修复行情/指令。{errors[:3]}")
+    save_csv_atomic(positions, previous_position_path)
     save_csv_atomic(snapshot, snapshot_path)
     save_excel_report(active_master_path, {"active_grid_master": active_master})
     save_excel_report(ledger_path, {"delta_ledger": ledger_out})
@@ -2632,14 +2666,14 @@ def main() -> int:
 
     report_path = outdir / f"{args.prefix}_复核报告.xlsx"
     run_meta = pd.DataFrame([{
-        "calculation_mode": "baseline_recompute" if baseline_recompute else "incremental_state",
+        "calculation_mode": "authoritative_snapshot_refresh",
         "execution_policy": POLICY_VERSION,
         "position_file": str(args.position_file or ""),
         "oplus_file": str(args.oplus_file or ""),
         "instruction_file": str(args.instruction_file or ""),
         "asof_date": str(args.asof_date),
         "simulation_product": SIM_PRODUCT_NAME,
-        "simulation_source_product": "净值线3号",
+        "simulation_source_product": "聚砾1号",
         "simulation_nav": sim_product_nav,
         "simulation_nav_source": sim_nav_source,
         "liquidity_participation": float(args.liquidity_participation),
@@ -2692,6 +2726,7 @@ def main() -> int:
         latest_result = refresh_latest_outputs(
             args.project_root, args.summary_start_date, outdir,
             engine=sys.modules[__name__], basket_template=args.basket_template,
+            latest_folder=str(Path(args.project_root) / "最新输出文件" / "聚砾1号"), scan_legacy=False,
         )
         print(f"最新输出与历史汇总已覆盖更新：{latest_result['folder']}")
         for market, path in latest_result["paths"].items():
@@ -2725,23 +2760,26 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--hk-template", default="", help="港股买卖清单导入模板.xlsx；不填则从 live_grid_project 根目录自动寻找")
     p.add_argument("--basket-template", default="", help="现货篮子指令参考模板.xlsx；不填则从项目根目录自动寻找")
     p.add_argument("--asof-date", default="", help="运行日期，例如 2026-06-23；不填默认今天")
-    p.add_argument("--output-dir", default="", help="输出目录；正常默认 最新输出文件/网格日期，回放默认 outputs_replay_real/日期")
+    p.add_argument("--output-dir", default="", help="输出目录；正常默认 最新输出文件/聚砾1号/网格日期，回放独立保存")
     p.add_argument("--summary-start-date", default="2026-10-13", help="汇总起始业务日期（含）；每次正常运行覆盖更新最新输出文件中的A股/港股汇总")
-    p.add_argument("--state-dir", default="", help="状态目录；正常默认 state改/state日期，回放默认 state_replay_real/日期")
+    p.add_argument("--state-dir", default="", help="状态目录；默认 运行状态/聚砾1号/state日期")
     p.add_argument("--project-root", default="", help="项目根目录；默认当前 live_grid_simulator.py 所在文件夹")
     p.add_argument("--prefix", default="实盘网格", help="输出文件名前缀")
     p.add_argument("--sheets", default="股票指令", help="读取指令 sheet，逗号分隔；默认 股票指令")
-    p.add_argument("--position-file", default="", help="固定持仓基线文件；默认每次都从该文件重新计算，再完整应用指定 Oplus")
-    p.add_argument("--incremental-state-mode", action="store_true", help="改用旧的跨日增量状态模式：沿用 state/current_positions.csv 并只应用 Oplus 新增进度")
-    p.add_argument("--no-apply-oplus-trades", action="store_true", help="不把 oplus 成交数据累加到持仓基线")
+    p.add_argument("--position-file", default="", help="真实持仓快照；每次重新读取，不叠加Oplus，不沿用旧比例")
+    p.add_argument("--incremental-state-mode", action="store_true", help="兼容旧参数；现在每次按真实快照更新仓位并全量刷新网格，不再滚动历史比例")
+    p.add_argument("--no-apply-oplus-trades", action="store_true", default=True, help="不把 oplus 成交数据累加到持仓基线")
     p.add_argument("--reset-oplus-state", action="store_true", help="清空 Oplus 已应用进度记录；仅在重新建立持仓基线时使用")
     p.add_argument("--reset-position-state", action="store_true", help="忽略 state/current_positions.csv，重新用 --position-file 建立仓位基线")
     p.add_argument("--changed-codes", default="", help="手动指定本次只刷新的代码，逗号分隔；不填则自动比较指令 hash")
     p.add_argument("--full-refresh", action="store_true", help="全量刷新所有指令股票")
     p.add_argument("--force", action="store_true", help="忽略 delta ledger 去重，强制输出")
     p.add_argument("--price-band", type=float, default=0.10, help="只输出参考价上下该比例内的网格，默认 0.10")
+    p.add_argument("--price-band-mode", choices=["board", "fixed"], default="board", help="默认按板块10/20/30%%过滤自动档")
+    p.add_argument("--price-round-digits", type=int, default=2)
+    p.add_argument("--allow-same-day-opposite", action="store_true", help="显式允许双向；默认只留距参考价近的一侧")
     p.add_argument("--min-order-weight", type=float, default=0.0001, help="最小单档仓位差额，默认 0.0001=0.01%%")
-    p.add_argument("--sim-nav", type=float, default=0.0, help="巨杉网格化模拟产品净资产；默认从净值线3号全球持仓查询自动推断")
+    p.add_argument("--sim-nav", type=float, default=0.0, help="巨杉网格化模拟产品净资产；默认从聚砾1号全球持仓查询自动推断")
     p.add_argument("--liquidity-participation", type=float, default=SIM_DEFAULT_PARTICIPATION_RATE, help="昨日分钟成交量最大参与率，默认 0.01=1%%")
     p.add_argument("--minute-lookback-days", type=int, default=10, help="向前寻找最近交易日分钟线的最大日历天数，默认10")
     p.add_argument("--disable-liquidity-simulation", action="store_true", help="只生成原始网格，不做昨日分钟流动性成交模拟")

@@ -26,7 +26,7 @@ def refresh_latest_outputs(
     root = Path(project_root).resolve()
     start = pd.to_datetime(start_date, errors="raise").normalize()
     # latest_folder 供隔离实验（如改1）使用；默认保持队友原口径写“最新输出文件”。
-    latest = Path(latest_folder).resolve() if latest_folder else root / "最新输出文件"
+    latest = Path(latest_folder).resolve() if latest_folder else root / "最新输出文件" / "聚砾1号"
     template = Path(basket_template) if basket_template else root / "现货篮子指令参考模板.xlsx"
     if not template.is_absolute():
         template = root / template
@@ -35,7 +35,7 @@ def refresh_latest_outputs(
     reports: dict[str, Path] = {}
     scores: dict[str, tuple[int, int, int]] = {}
     # scan_legacy=False 时只看隔离目录与本次运行，避免把其他日期/旧目录混入实验汇总。
-    sources = [root / "outputs_live_grid改", latest] if scan_legacy else [latest]
+    sources = [latest]  # 不把净值线3号或旧规则结果混入聚砾汇总。
     candidates = [p for parent in sources if parent.exists() for p in parent.glob("网格????????/网格????????_复核报告.xlsx")]
     if current and current.exists():
         candidates.extend(current.glob("网格????????_复核报告.xlsx"))
@@ -53,6 +53,16 @@ def refresh_latest_outputs(
             reports[token] = report
     if not reports:
         raise FileNotFoundError(f"没有找到 {start.date()} 起的正常模式复核报告，未覆盖汇总。")
+
+    from manager_execution_policy import POLICY_VERSION
+    excluded = []
+    for token, report in list(reports.items()):
+        meta = pd.read_excel(report, sheet_name="run_meta")
+        if meta.empty or meta.iloc[0].get("execution_policy") != POLICY_VERSION or meta.iloc[0].get("simulation_product") != engine.SIM_PRODUCT_NAME:
+            excluded.append(token)
+            del reports[token]
+    if not reports:
+        raise ValueError("没有当前聚砾及规则版本的报告；请先正常运行，旧产品结果不参与汇总。")
 
     combined: dict[str, list[list[Any]]] = {"A股": [], "港股": []}
     provenance = []
@@ -129,7 +139,10 @@ def refresh_latest_outputs(
         paths[market] = path
     columns = ["市场", "业务日期", "汇总Excel行号", "每日文件", "每日Excel行号", "证券代码", "委托方向", "净值比例(%)"]
     engine.save_csv_atomic(pd.DataFrame(provenance, columns=columns), summary_dir / "汇总来源.csv")
-    return {"folder": latest, "start_date": start.strftime("%Y-%m-%d"), "end_date": max(reports), "days": days, "paths": paths, "counts": {market: len(rows) for market, rows in combined.items()}}
+    manual = latest / f"网格{max(reports)}" / f"网格{max(reports)}_手工下单文件.xlsx"
+    if manual.exists():
+        shutil.copy2(manual, latest / "手工下单文件.xlsx")
+    return {"folder": latest, "start_date": start.strftime("%Y-%m-%d"), "end_date": max(reports), "days": days, "paths": paths, "excluded_dates": excluded, "counts": {market: len(rows) for market, rows in combined.items()}}
 
 
 def main() -> int:

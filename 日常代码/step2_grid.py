@@ -36,11 +36,9 @@ def main() -> None:
     print()
     # 把用户传的所有参数原样透传给当前主程序（含流动性模拟与比例汇总）
     grid_args = sys.argv[1:]
-    # 默认价格带 ±30%（原版默认±10%太窄，会过滤掉大量档位）；用户显式传了则不覆盖
-    if not any(a.startswith("--price-band") for a in grid_args):
-        grid_args = ["--price-band", "0.30"] + grid_args
+    # 带宽默认由主程序按板块决定；显式参数原样透传。
     run([sys.executable, str(ROOT / "live_grid_simulator_current改.py"), *grid_args])
-    print("\n第 2 步完成。去 最新输出文件\\ 拿每日买卖清单和汇总指令。")
+    print("\n第 2 步完成。去 最新输出文件\\聚砾1号\\ 拿每日买卖清单和汇总指令。")
 
 
 if __name__ == "__main__":

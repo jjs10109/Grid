@@ -7,7 +7,7 @@ from pathlib import Path
 from openpyxl import load_workbook
 from openpyxl.styles import Alignment
 
-POLICY_VERSION = "manager_manual_intermediate_90_v1"
+POLICY_VERSION = "juli_snapshot_board_one_side_manual90_v2"
 AUTO_COMPLETION = 0.90
 
 
