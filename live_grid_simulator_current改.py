@@ -45,6 +45,7 @@ from data_loader import (
 from features_daily import prepare_daily_features
 from grid_engine import evaluate_manager_grid_splitter
 from instruction_reader import parse_instruction_excel
+from manager_execution_policy import apply_manager_execution_policy, manual_order_table, export_manual_order_file, POLICY_VERSION
 
 TEMPLATE_HEADERS = ["证券代码", "证券名称", "产品名称", "单元名称", "交易市场", "委托方向", "数量/仓位", "极限价格"]
 BASKET_TEMPLATE_HEADERS = ["证券代码", "证券名称", "交易市场", "委托方向", "价格类型", "指令价格", "指令数量", "指令金额", "净值比例(%)"]
@@ -283,7 +284,7 @@ def resolve_run_layout(
 ) -> Tuple[Path, Path, str]:
     """按模式与业务日期解析最终输出/状态目录及文件前缀。
 
-    正常模式：outputs_live_grid改/网格{yyyymmdd}，state改/state{yyyymmdd}，前缀=网格{yyyymmdd}。
+    正常模式：最新输出文件/网格{yyyymmdd}，state改/state{yyyymmdd}，前缀=网格{yyyymmdd}。
     回放模式：outputs_replay_real/{yyyymmdd}，state_replay_real/{yyyymmdd}，前缀沿用调用方。
     显式 --output-dir/--state-dir 优先（不追加日期子目录）。
     """
@@ -295,7 +296,7 @@ def resolve_run_layout(
         file_prefix = str(arg_prefix).strip() or f"回放{token}"
     else:
         grid_label = f"网格{token}"
-        out_default = root / "outputs_live_grid改" / grid_label
+        out_default = root / "最新输出文件" / grid_label
         state_default = root / "state改" / f"state{token}"
         file_prefix = grid_label
     out_path = Path(output_dir).expanduser() if str(output_dir).strip() else out_default
@@ -342,7 +343,7 @@ def resolve_runtime_inputs(args: argparse.Namespace) -> argparse.Namespace:
         args.hk_template = str(find_template_file(root, "HK"))
     if not getattr(args, "basket_template", ""):
         args.basket_template = str(find_basket_template_file(root))
-    # 目录按模式+业务日期规整：正常 -> outputs_live_grid改/网格日期 & state改/state日期；
+    # 目录按模式+业务日期规整：正常 -> 最新输出文件/网格日期 & state改/state日期；
     # 回放 -> outputs_replay_real/日期 & state_replay_real/日期。显式 --output-dir/--state-dir 优先。
     replay_only = bool(str(getattr(args, "replay_grid_file", "")).strip())
     business_date = derive_business_date(args.asof_date)
@@ -738,24 +739,8 @@ def export_basket_reference_template(
     template_path: str | Path,
     output_path: str | Path,
 ) -> Path:
-    """Export simulated fills as fixed-share orders in the spot basket template."""
+    """按每笔交易仓位比例导出；数量、金额留空，product_nav仅保留接口兼容。"""
     has_orders = orders_df is not None and not orders_df.empty
-    if has_orders and (not np.isfinite(product_nav) or product_nav <= 0):
-        raise ValueError(f"现货篮子固定数量需要有效基金净值，当前净值为 {product_nav!r}。")
-
-    template_path = Path(template_path)
-    output_path = Path(output_path)
-    wb = load_workbook(template_path)
-    ws = wb[wb.sheetnames[0]]
-    headers = [ws.cell(1, c).value for c in range(1, len(BASKET_TEMPLATE_HEADERS) + 1)]
-    if headers != BASKET_TEMPLATE_HEADERS:
-        raise ValueError(f"现货篮子模板表头不匹配：{headers}，期望={BASKET_TEMPLATE_HEADERS}")
-    style_row = 2 if ws.max_row >= 2 else 1
-    price_type = ws.cell(style_row, 5).value or "1-最新价"
-
-    for r in range(2, ws.max_row + 1):
-        for c in range(1, len(BASKET_TEMPLATE_HEADERS) + 1):
-            ws.cell(r, c).value = None
 
     running_positions: Dict[Tuple[str, str, str], float] = {}
     if positions is not None and not positions.empty:
@@ -780,7 +765,7 @@ def export_basket_reference_template(
             previous_pos = running_positions.get(key, 0.0)
             target_pos = _safe_float(order.get("target_pos"), np.nan)
             price = _safe_float(order.get("price"), np.nan)
-            if not np.isfinite(target_pos) or not np.isfinite(price) or price <= 0:
+            if not np.isfinite(target_pos) or not 0.0 <= target_pos <= 1.0 or not np.isfinite(price) or price <= 0:
                 raise ValueError(
                     f"现货篮子订单缺少有效目标仓位或价格：{code}，"
                     f"target_pos={order.get('target_pos')!r}，price={order.get('price')!r}"
@@ -788,29 +773,47 @@ def export_basket_reference_template(
 
             delta_pos = target_pos - previous_pos
             side = str(order.get("side", "")).lower()
+            if side not in {"buy", "sell"}:
+                raise ValueError(f"{code} 的模拟方向无效：{side!r}。")
             if delta_pos > 1e-12 and side != "buy":
                 raise ValueError(f"{code} 的目标仓位增加但模拟方向不是买入。")
             if delta_pos < -1e-12 and side != "sell":
                 raise ValueError(f"{code} 的目标仓位减少但模拟方向不是卖出。")
             running_positions[key] = target_pos
 
-            raw_quantity = abs(delta_pos) * product_nav / price
-            quantity = math.floor(raw_quantity / BASKET_LOT_SIZE + 1e-12) * BASKET_LOT_SIZE
-            if quantity <= 0:
+            # 百分数点：3% -> 5% 的买单填2，而不是目标5或小数0.02。
+            nav_ratio = round(abs(delta_pos) * 100.0, 10)
+            if nav_ratio <= 0:
                 continue
-            amount = round(quantity * price, 2)
-            nav_ratio = amount / product_nav * 100.0
             rows.append([
                 code.split(".", 1)[0],
                 order.get("name", ""),
                 basket_trade_market(code),
                 "1-买入" if side == "buy" else "2-卖出",
-                price_type,
+                "f-指定价",
                 float(price),
-                int(quantity),
-                amount,
-                round(nav_ratio, 6),
+                None,
+                None,
+                nav_ratio,
             ])
+
+    return write_basket_reference_rows(rows, template_path, output_path)
+
+
+def write_basket_reference_rows(
+    rows: Sequence[Sequence[Any]], template_path: str | Path, output_path: str | Path,
+) -> Path:
+    """日文件与汇总文件共用原现货篮子的九列表头和样式。"""
+    output_path = Path(output_path)
+    wb = load_workbook(template_path)
+    ws = wb[wb.sheetnames[0]]
+    headers = [ws.cell(1, c).value for c in range(1, len(BASKET_TEMPLATE_HEADERS) + 1)]
+    if headers != BASKET_TEMPLATE_HEADERS:
+        raise ValueError(f"现货篮子模板表头不匹配：{headers}，期望={BASKET_TEMPLATE_HEADERS}")
+    style_row = 2 if ws.max_row >= 2 else 1
+    for r in range(2, ws.max_row + 1):
+        for c in range(1, len(BASKET_TEMPLATE_HEADERS) + 1):
+            ws.cell(r, c).value = None
 
     for r in range(ws.max_row + 1, max(len(rows), 1) + 2):
         _copy_row_style(ws, style_row, r, len(BASKET_TEMPLATE_HEADERS))
@@ -818,6 +821,7 @@ def export_basket_reference_template(
         _copy_row_style(ws, style_row, idx, len(BASKET_TEMPLATE_HEADERS))
         for c, value in enumerate(values, start=1):
             ws.cell(idx, c).value = value
+        ws.cell(idx, 9).number_format = "0.000000"
     for r in range(len(rows) + 2, ws.max_row + 1):
         for c in range(1, len(BASKET_TEMPLATE_HEADERS) + 1):
             ws.cell(r, c).value = None
@@ -825,11 +829,19 @@ def export_basket_reference_template(
     # 无成交的空文件：清空循环会清掉样式行，这里在最后把价格类型写回第5列，
     # 保证空文件也保留 f-指定价口径标记。
     if not rows:
-        ws.cell(style_row, 5).value = price_type
+        ws.cell(style_row, 5).value = "f-指定价"
 
     ws.sheet_view.topLeftCell = None
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    wb.save(output_path)
+    temporary = output_path.with_name(output_path.stem + ".tmp.xlsx")
+    try:
+        wb.save(temporary)
+        wb.close()
+        temporary.replace(output_path)
+    finally:
+        wb.close()
+        if temporary.exists():
+            temporary.unlink()
     return output_path
 
 
@@ -1641,6 +1653,10 @@ def build_orders_for_code(
     sell_levels_raw = row.get("sell_levels") or []
     instruction_id = str(row.get("instruction_hash", ""))
 
+    if len({float(x["price"]) for x in buy_levels_raw}) < 2 and len({float(x["price"]) for x in sell_levels_raw}) < 2:
+        # 没有两个原始档位就没有中间自动网格；手工清单独立生成，不依赖行情。
+        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+
     # D 日网格只能使用 Oplus 日（通常 D-1）及以前的历史行情，避免历史重跑前视。
     profile = fetch_daily_profile_cached(code, market_data_date, args.lookback_years, args.price_adj, daily_cache)
 
@@ -1702,15 +1718,18 @@ def build_orders_for_code(
 
         side_tables = []
         if res.get("buy_table") is not None and not res["buy_table"].empty:
-            t = res["buy_table"].copy()
+            t = apply_manager_execution_policy(res["buy_table"], buy_levels, "buy")
             t["side"] = "buy"
-            t["source_basis"] = t.apply(lambda z: source_basis_for_row(z, buy_levels), axis=1)
+            if not t.empty:
+                t["source_basis"] = t.apply(lambda z: source_basis_for_row(z, buy_levels), axis=1)
             side_tables.append(t)
         if res.get("sell_table") is not None and not res["sell_table"].empty:
-            t = res["sell_table"].copy()
+            t = apply_manager_execution_policy(res["sell_table"], sell_levels, "sell")
             t["side"] = "sell"
-            t["source_basis"] = t.apply(lambda z: source_basis_for_row(z, sell_levels), axis=1)
+            if not t.empty:
+                t["source_basis"] = t.apply(lambda z: source_basis_for_row(z, sell_levels), axis=1)
             side_tables.append(t)
+        side_tables = [t for t in side_tables if not t.empty]
         if not side_tables:
             continue
 
@@ -1771,6 +1790,8 @@ def build_orders_for_code(
                     "position_after_level": after_pos,
                     "source_basis": lvl.get("source_basis", ""),
                     "is_manager_level": bool(lvl.get("is_manager_level", False)),
+                    **{k: lvl.get(k) for k in ["execution_policy", "manual_policy_interval", "manager_start_price", "manager_end_price",
+                                                "manager_start_target", "manager_end_target", "automatic_completion"]},
                     "instruction_hash": instruction_id,
                     "dedupe_key": key,
                     "pass_position_check": valid,
@@ -2445,6 +2466,8 @@ def main() -> int:
     active_master_path = state_dir / "active_grid_master.xlsx"
     ledger_path = state_dir / "delta_ledger.xlsx"
     prev_active = load_active_master(active_master_path)
+    if not prev_active.empty and ("execution_policy" not in prev_active or not prev_active["execution_policy"].eq(POLICY_VERSION).all()):
+        args.full_refresh = True
 
     if baseline_recompute:
         # 固定基线重算时，旧 snapshot/active master 不能参与决定本次计算范围。
@@ -2569,6 +2592,14 @@ def main() -> int:
             active_master = active_master[active_master["product"] == SIM_PRODUCT_NAME].copy()
             active_master = active_master.drop_duplicates(subset=["dedupe_key"], keep="last")
 
+    # 包括旧增量状态与旧回放网格：缺少新规则标记时不能继续执行经理原始档位。
+    if not active_master.empty and ("execution_policy" not in active_master or not active_master["execution_policy"].eq(POLICY_VERSION).all()):
+        raise ValueError("旧网格尚未应用经理档位手工执行/90%规则，请先正常模式全量重建后再增量或回放。")
+
+    manual_orders = manual_order_table(snapshot, accounts, positions, active_master, derive_business_date(args.asof_date), sys.modules[__name__])
+    manual_path = outdir / f"{args.prefix}_手工下单文件.xlsx"
+    export_manual_order_file(manual_orders, manual_path, sys.modules[__name__])
+
     ledger_out = pd.concat([ledger if ledger is not None else pd.DataFrame(), new_orders], ignore_index=True)
     if not ledger_out.empty and "dedupe_key" in ledger_out.columns:
         ledger_out = ledger_out.drop_duplicates(subset=["dedupe_key"], keep="first")
@@ -2602,6 +2633,7 @@ def main() -> int:
     report_path = outdir / f"{args.prefix}_复核报告.xlsx"
     run_meta = pd.DataFrame([{
         "calculation_mode": "baseline_recompute" if baseline_recompute else "incremental_state",
+        "execution_policy": POLICY_VERSION,
         "position_file": str(args.position_file or ""),
         "oplus_file": str(args.oplus_file or ""),
         "instruction_file": str(args.instruction_file or ""),
@@ -2627,6 +2659,7 @@ def main() -> int:
         "liquidity_sim_audit": simulation_audit,
         "liquidity_minute_summary": simulation_minute_summary,
         "errors": errors_df,
+        "manual_orders": manual_orders,
     })
 
     active_a, active_hk = split_orders_by_market(active_master)
@@ -2652,6 +2685,17 @@ def main() -> int:
         simulated_hk, positions, sim_product_nav, args.basket_template, paths["simulated_hk_template"]
     )
     export_manager_instruction_style(active_master, paths["manager_instruction"])
+    print(f"经理原始档位手工清单：{manual_path}")
+
+    if not replay_only:
+        from latest_grid_outputs import refresh_latest_outputs
+        latest_result = refresh_latest_outputs(
+            args.project_root, args.summary_start_date, outdir,
+            engine=sys.modules[__name__], basket_template=args.basket_template,
+        )
+        print(f"最新输出与历史汇总已覆盖更新：{latest_result['folder']}")
+        for market, path in latest_result["paths"].items():
+            print(f"{market}汇总：{latest_result['counts'][market]} 条 -> {path}")
 
     print("\n========== 实盘网格生成完成 ==========")
     print(f"指令股票数（A/H）：{len(snapshot)}")
@@ -2681,7 +2725,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--hk-template", default="", help="港股买卖清单导入模板.xlsx；不填则从 live_grid_project 根目录自动寻找")
     p.add_argument("--basket-template", default="", help="现货篮子指令参考模板.xlsx；不填则从项目根目录自动寻找")
     p.add_argument("--asof-date", default="", help="运行日期，例如 2026-06-23；不填默认今天")
-    p.add_argument("--output-dir", default="", help="输出目录；正常默认 outputs_live_grid改/网格日期，回放默认 outputs_replay_real/日期")
+    p.add_argument("--output-dir", default="", help="输出目录；正常默认 最新输出文件/网格日期，回放默认 outputs_replay_real/日期")
+    p.add_argument("--summary-start-date", default="2026-10-13", help="汇总起始业务日期（含）；每次正常运行覆盖更新最新输出文件中的A股/港股汇总")
     p.add_argument("--state-dir", default="", help="状态目录；正常默认 state改/state日期，回放默认 state_replay_real/日期")
     p.add_argument("--project-root", default="", help="项目根目录；默认当前 live_grid_simulator.py 所在文件夹")
     p.add_argument("--prefix", default="实盘网格", help="输出文件名前缀")
